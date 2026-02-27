@@ -3,7 +3,7 @@ export async function GET() {
 
   try {
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 3000)
+    const timeout = setTimeout(() => controller.abort(), 15000)
 
     const res = await fetch(`${backendUrl}/education/topics`, {
       method: 'GET',
@@ -14,7 +14,23 @@ export async function GET() {
 
     if (!res.ok) throw new Error(`Backend error: ${res.status}`)
     const data = await res.json()
-    return Response.json({ success: true, data, source: 'backend' })
+    // Normalize to { BEGINNER: [titles], INTERMEDIATE: [...], ADVANCED: [...] }
+    const raw = data?.data?.topics ?? data
+    let topicsByLevel = {}
+    if (Array.isArray(raw)) {
+      // Older backend response: array of topic items with level & title
+      for (const item of raw) {
+        const lvl = String(item.level || '').toUpperCase()
+        if (!lvl) continue
+        topicsByLevel[lvl] = topicsByLevel[lvl] || []
+        topicsByLevel[lvl].push(item.title || item.topic)
+      }
+    } else if (raw && typeof raw === 'object') {
+      for (const [lvl, arr] of Object.entries(raw)) {
+        topicsByLevel[lvl] = (arr || []).map((t) => t.title || t.topic || t)
+      }
+    }
+    return Response.json({ success: true, data: topicsByLevel, source: 'backend' })
 
   } catch (error) {
     console.warn(`[API] Backend unavailable, using mock data: ${error.message}`)

@@ -3,6 +3,7 @@
 import React from 'react';
 import { Menu, Bell, User } from 'lucide-react';
 import { useUser } from '@/context/UserContext';
+import BackendStatus from '@/components/ui/BackendStatus';
 
 export default function Navbar({ onMenuClick }) {
   const user = useUser();
@@ -21,8 +22,11 @@ export default function Navbar({ onMenuClick }) {
         <div className="text-xl font-bold text-blue-500">FinNexus</div>
       </div>
 
-      {/* Right: Balance, Notifications, Avatar */}
+      {/* Right: Backend status, Balance, Notifications, Avatar */}
       <div className="flex items-center gap-6">
+        <div className="hidden md:block">
+          <BackendStatus />
+        </div>
         {/* Virtual Balance Display */}
         <div className="text-sm hidden md:block">
           <div className="text-slate-400">Virtual Balance</div>

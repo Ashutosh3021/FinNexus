@@ -1,34 +1,59 @@
 export async function GET() {
+  const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+
   try {
-    const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 3000)
+
     const res = await fetch(`${backendUrl}/advisor/context-summary`, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' },
-    });
+      signal: controller.signal
+    })
+    clearTimeout(timeout)
 
-    if (!res.ok) {
-      console.warn('Backend returned non-OK status for /advisor/context-summary', res.status);
-      // Fallback mock context so UI can render
-      const fallback = {
-        success: false,
-        data: {
-          portfolio_summary: { summary: 'No portfolio data', holdings_count: 0, total_value: 0, currency: 'INR' },
-          prediction_stats: { win_rate: 0, current_streak: 0, total_rounds: 0, recent_results: [], trend: 'declining' },
-          news_headlines: [],
-          learning_progress: { completed_topics: 0, total_topics: 0, weak_areas: [], current_topic: null }
-        },
-        error: 'Backend unavailable'
-      };
-      return Response.json(fallback, { status: 200 });
-    }
+    if (!res.ok) throw new Error(`Backend error: ${res.status}`)
+    const data = await res.json()
+    return Response.json({ success: true, data, source: 'backend' })
 
-    const data = await res.json();
-    return Response.json(data, { status: 200 });
   } catch (error) {
-    console.error('Error fetching advisor context:', error);
-    return Response.json(
-      { success: false, error: 'Failed to fetch context' },
-      { status: 500 }
-    );
+    console.warn(`[API] Backend unavailable, using mock data: ${error.message}`)
+    return Response.json({ success: true, data: getMockData(), source: 'mock' })
+  }
+}
+
+function getMockData() {
+  return {
+    portfolio: {
+      totalValue: 124500,
+      totalPnl: 24500,
+      pnlPercent: 24.5,
+      topHolding: 'BTC-USD',
+      riskScore: 7,
+      riskLabel: 'high',
+      allocation: [
+        { name: 'Stocks', value: 40, color: '#3B82F6' },
+        { name: 'Crypto', value: 30, color: '#F59E0B' },
+        { name: 'Gold', value: 15, color: '#EAB308' },
+        { name: 'Index', value: 15, color: '#10B981' }
+      ]
+    },
+    predictions: {
+      winRate: 62.5,
+      totalRounds: 8,
+      streak: 2,
+      recentResults: ['win','win','loss','win','win']
+    },
+    learning: {
+      progressPercent: 45,
+      completedTopics: ['What is Stock Market','P/E Ratio','RSI','Bull vs Bear'],
+      weakTopics: ['Bollinger Bands', 'Sharpe Ratio'],
+      currentTopic: 'How Interest Rates Affect Markets'
+    },
+    news: [
+      { headline: 'Fed holds rates steady at 5.25%', sentiment: 'neutral', category: 'Central Bank' },
+      { headline: 'Bitcoin ETF sees record $500M inflows', sentiment: 'positive', category: 'Crypto' },
+      { headline: 'NIFTY hits all-time high above 22,000', sentiment: 'positive', category: 'Stock' }
+    ]
   }
 }

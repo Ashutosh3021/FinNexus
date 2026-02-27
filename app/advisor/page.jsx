@@ -42,7 +42,8 @@ export default function AdvisorPage() {
 
   const fetchContextSummary = async () => {
     try {
-      const res = await fetch('/api/advisor/context-summary');
+      const base = process.env.NEXT_PUBLIC_API_URL || '';
+      const res = await fetch(`${base}/advisor/context-summary`);
       const data = await res.json();
       if (data.success) {
         setContext(data.data);
@@ -61,7 +62,8 @@ export default function AdvisorPage() {
     setIsLoading(true);
 
     try {
-      const res = await fetch('/api/advisor/chat', {
+      const base = process.env.NEXT_PUBLIC_API_URL || '';
+      const res = await fetch(`${base}/advisor/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

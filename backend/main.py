@@ -3,17 +3,28 @@ Main FastAPI application for FinNexus backend.
 Startup sequence performs model loading, optional RAG seeding, and prints health.
 """
 import logging
-from fastapi import FastAPI
+from fastapi import FastAPI, Body, Query
+from fastapi.middleware.cors import CORSMiddleware
+from backend.config import get_cors_origins
 
 from backend.routers.playground import router as playground_router
 from backend.routers.portfolio import router as portfolio_router
 from backend.routers.news import router as news_router
 from backend.routers.education import router as education_router
 from backend.routers.advisor import router as advisor_router
+from backend.routers import education as education_handlers
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FinNexus API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def root():
@@ -70,7 +81,30 @@ app.include_router(news_router)
 app.include_router(education_router)
 app.include_router(advisor_router)
 
+@app.get("/education/topics")
+async def education_topics_alias():
+    return await education_handlers.get_topics()
+
+@app.post("/education/ask")
+async def education_ask_alias(payload: dict = Body(...)):
+    return await education_handlers.ask_concept(payload)
+
+@app.get("/education/lesson/{topic_slug}")
+async def education_lesson_alias(topic_slug: str, level: str = Query("BEGINNER")):
+    return await education_handlers.get_lesson(topic_slug, level)
+
+@app.post("/education/quiz/submit")
+async def education_quiz_submit_alias(payload: dict = Body(...)):
+    return await education_handlers.submit_quiz(payload)
+
+@app.get("/education/search")
+async def education_search_alias(q: str = Query(...), level: str = Query(None)):
+    return await education_handlers.search(q, level)
+
+@app.get("/education/stats")
+async def education_stats_alias():
+    return await education_handlers.stats()
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)

@@ -42,7 +42,8 @@ class ContextSummaryResponse(BaseModel):
 
 def _build_portfolio_summary(portfolio: List) -> Dict[str, Any]:
     """Build human-readable portfolio summary for Gemini."""
-    if not portfolio:
+    # Normalize input to list of holdings
+    if not portfolio or isinstance(portfolio, dict):
         return {"summary": "No portfolio data", "holdings_count": 0}
     
     summary_text = f"You hold {len(portfolio)} positions:\n"
@@ -75,16 +76,24 @@ def _build_prediction_stats(history: List) -> Dict[str, Any]:
             "total_rounds": 0,
             "recent_results": []
         }
-    
-    wins = sum(1 for h in history if h.get("result") == "win")
+    # Accept list of dicts or list of strings
+    normalized = []
+    for h in history:
+        if isinstance(h, dict):
+            normalized.append(h.get("result", "unknown"))
+        elif isinstance(h, str):
+            normalized.append(h)
+    if not normalized:
+        normalized = []
+    wins = sum(1 for r in normalized if r == "win")
     total = len(history)
     win_rate = (wins / total * 100) if total > 0 else 0
     
     # Calculate streak (consecutive wins/losses)
     streak = 0
     streak_type = None
-    for h in reversed(history[-10:]):
-        result = h.get("result")
+    for r in reversed(normalized[-10:]):
+        result = r
         if streak_type is None:
             streak_type = result
             streak = 1
@@ -97,23 +106,23 @@ def _build_prediction_stats(history: List) -> Dict[str, Any]:
         "win_rate": round(win_rate, 1),
         "current_streak": streak,
         "total_rounds": total,
-        "recent_results": [h.get("result", "unknown") for h in history[-5:]],
-        "trend": "improving" if history[-1].get("result") == "win" else "declining"
+        "recent_results": normalized[-5:],
+        "trend": "improving" if (normalized and normalized[-1] == "win") else "declining"
     }
 
 def _fetch_top_news() -> List[Dict[str, Any]]:
     """Fetch top 3 news headlines with sentiment."""
     try:
-        news = news_service.fetch_news_feed(limit=3)
-        if news and news.get("success"):
-            return [
-                {
+        items = news_service.fetch_news_feed(limit=3)
+        if items and isinstance(items, list):
+            out = []
+            for item in items[:3]:
+                out.append({
                     "headline": item.get("headline", ""),
                     "sentiment": item.get("sentiment", "neutral"),
                     "category": item.get("category", "general")
-                }
-                for item in news.get("data", [])[:3]
-            ]
+                })
+            return out
     except Exception as e:
         logger.warning(f"Failed to fetch news for advisor: {e}")
     
@@ -137,6 +146,15 @@ async def advisor_chat(request: AdvisorChatRequest) -> APIResponse:
     """
     try:
         user_context = request.user_context
+        # Defensive normalization to avoid client-side shape mismatches
+        portfolio_in = user_context.get("portfolio", [])
+        if isinstance(portfolio_in, dict):
+            portfolio_in = []
+        prediction_hist_in = user_context.get("prediction_history", [])
+        if prediction_hist_in and isinstance(prediction_hist_in, list) and isinstance(prediction_hist_in[0], str):
+            prediction_hist_in = [{"result": r} for r in prediction_hist_in]
+        user_context["portfolio"] = portfolio_in
+        user_context["prediction_history"] = prediction_hist_in
         
         # Build summaries for Gemini
         portfolio_summary_dict = _build_portfolio_summary(user_context.get("portfolio", []))

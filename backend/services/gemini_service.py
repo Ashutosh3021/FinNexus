@@ -16,10 +16,11 @@ logger = logging.getLogger(__name__)
 # Configure Gemini API (try both key names)
 api_key = settings.google_api_key or settings.gemini_api_key
 if not api_key:
-    logger.warning("No Gemini API key configured. Set GOOGLE_API_KEY or GEMINI_API_KEY environment variable.")
-    
-genai.configure(api_key=api_key or "")
-model = genai.GenerativeModel("gemini-2.5-flash")
+    logger.warning("No Gemini API key configured. Falling back to local responses.")
+    model = None
+else:
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.5-flash")
 
 # ═══════════════════════════════════════════════════════════════════
 # HELPER: JSON Response Parser with Fallback
@@ -112,6 +113,8 @@ Respond ONLY in this exact JSON format (no markdown, no backticks):
     }
     
     try:
+        if model is None:
+            return fallback
         response = model.generate_content(prompt)
         result = _parse_gemini_json(response.text, fallback)
         elapsed = time.time() - start_time
@@ -191,6 +194,8 @@ Return ONLY this JSON:
     }
     
     try:
+        if model is None:
+            return fallback
         response = model.generate_content(prompt)
         result = _parse_gemini_json(response.text, fallback)
         elapsed = time.time() - start_time
@@ -271,6 +276,8 @@ Return ONLY this JSON:
     }
     
     try:
+        if model is None:
+            return fallback
         response = model.generate_content(prompt)
         result = _parse_gemini_json(response.text, fallback)
         elapsed = time.time() - start_time

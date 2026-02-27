@@ -1,0 +1,23 @@
+# Render Backend Configuration
+services:
+  - type: python
+    version: "3.11"
+    buildCommand: |
+      pip install -r requirements.txt
+      python -c "import models.ml_loader; print('Models module OK')"
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: NEWSDATA_API_KEY
+        sync: false
+      - key: FRED_API_KEY
+        sync: false
+      - key: CHROMA_PERSIST_DIR
+        value: ./chroma_db
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    autoDeploy: false
+    pullRequestPreviewsEnabled: false

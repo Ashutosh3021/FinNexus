@@ -4,10 +4,16 @@ Loads environment variables using pydantic BaseSettings.
 """
 import os
 from typing import List, Optional
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
     """Application settings loaded from environment variables."""
     
     # API Keys
@@ -33,11 +39,6 @@ class Settings(BaseSettings):
     
     # Render
     render_external_url: Optional[str] = None
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
 
 
 settings = Settings()

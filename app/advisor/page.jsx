@@ -251,7 +251,7 @@ export default function AdvisorPage() {
             Today's Market Pulse
           </h3>
           <div className="space-y-2">
-            {news_headlines.map((news, i) => {
+            {(news_headlines || []).map((news, i) => {
               const sentimentColor = {
                 positive: 'text-green-400 bg-green-500/10',
                 negative: 'text-red-400 bg-red-500/10',

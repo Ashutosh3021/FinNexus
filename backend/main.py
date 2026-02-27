@@ -15,6 +15,14 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FinNexus API")
 
+@app.get("/")
+def root():
+  return {"name": "FinNexus API", "version": "1.0.0"}
+
+@app.get("/health")
+def health():
+  return {"status": "ok"}
+
 
 @app.on_event("startup")
 def on_startup():

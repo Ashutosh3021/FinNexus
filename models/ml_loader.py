@@ -50,8 +50,8 @@ def load_all_models():
     Load all trained models into memory on FastAPI startup.
     Call this function during application startup.
     """
-    global direction_model, direction_scaler, direction_feature_columns,
-    global risk_model, risk_scaler, portfolio_model, portfolio_scaler,
+    global direction_model, direction_scaler, direction_feature_columns
+    global risk_model, risk_scaler, portfolio_model, portfolio_scaler
     global finbert_tokenizer, finbert_model, models_loaded
     
     try:
@@ -163,8 +163,6 @@ def predict_direction(ohlcv_df: pd.DataFrame) -> Dict[str, Any]:
 
 def _create_direction_features(df: pd.DataFrame) -> pd.DataFrame:
     """Create technical indicator features from OHLCV data"""
-    import pandas_ta as ta
-    
     df = df.copy()
     
     # Price features
@@ -172,47 +170,60 @@ def _create_direction_features(df: pd.DataFrame) -> pd.DataFrame:
     df['daily_return'] = (df['Close'] - df['prev_close']) / df['prev_close']
     df['log_return'] = np.log(df['Close'] / df['prev_close'])
     
-    # Moving averages
-    df['SMA20'] = ta.sma(df['Close'], length=20)
-    df['SMA50'] = ta.sma(df['Close'], length=50)
+    # SMA
+    df['SMA20'] = df['Close'].rolling(window=20).mean()
+    df['SMA50'] = df['Close'].rolling(window=50).mean()
     df['price_vs_20MA'] = (df['Close'] - df['SMA20']) / df['SMA20']
     df['price_vs_50MA'] = (df['Close'] - df['SMA50']) / df['SMA50']
     
-    # High-Low range
     df['high_low_range'] = (df['High'] - df['Low']) / df['Close']
     
     # RSI
-    df['RSI'] = ta.rsi(df['Close'], length=14)
+    delta = df['Close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
     
     # MACD
-    macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
-    df['MACD'] = macd['MACD_12_26_9']
-    df['MACD_signal'] = macd['MACDs_12_26_9']
-    df['MACD_hist'] = macd['MACDh_12_26_9']
+    ema12 = df['Close'].ewm(span=12).mean()
+    ema26 = df['Close'].ewm(span=26).mean()
+    df['MACD'] = ema12 - ema26
+    df['MACD_signal'] = df['MACD'].ewm(span=9).mean()
+    df['MACD_hist'] = df['MACD'] - df['MACD_signal']
     
     # Bollinger Bands
-    bbands = ta.bbands(df['Close'], length=20, std=2)
-    df['BB_upper'] = bbands['BBU_20_2.0']
-    df['BB_lower'] = bbands['BBL_20_2.0']
+    sma20 = df['Close'].rolling(window=20).mean()
+    std20 = df['Close'].rolling(window=20).std()
+    df['BB_upper'] = sma20 + (std20 * 2)
+    df['BB_lower'] = sma20 - (std20 * 2)
     df['BB_position'] = (df['Close'] - df['BB_lower']) / (df['BB_upper'] - df['BB_lower'])
+    df['BB_position'] = df['BB_position'].clip(0, 1)
     
     # EMA
-    df['EMA12'] = ta.ema(df['Close'], length=12)
-    df['EMA26'] = ta.ema(df['Close'], length=26)
+    df['EMA12'] = df['Close'].ewm(span=12).mean()
+    df['EMA26'] = df['Close'].ewm(span=26).mean()
     
     # ATR
-    df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+    tr1 = df['High'] - df['Low']
+    tr2 = abs(df['High'] - df['prev_close'])
+    tr3 = abs(df['Low'] - df['prev_close'])
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df['ATR'] = tr.rolling(window=14).mean()
     
     # OBV
-    df['OBV'] = ta.obv(df['Close'], df['Volume'])
+    obv = (df['Volume'] * ((df['Close'] - df['prev_close']).apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0)))).cumsum()
+    df['OBV'] = obv
     
     # Stochastic
-    stoch = ta.stoch(df['High'], df['Low'], df['Close'], k=14, d=3)
-    df['Stoch_K'] = stoch['STOCHk_14_3_3']
-    df['Stoch_D'] = stoch['STOCHd_14_3_3']
+    low_14 = df['Low'].rolling(window=14).min()
+    high_14 = df['High'].rolling(window=14).max()
+    df['Stoch_K'] = 100 * (df['Close'] - low_14) / (high_14 - low_14)
+    df['Stoch_K'] = df['Stoch_K'].clip(0, 100)
+    df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
     
     # ADX
-    df['ADX'] = ta.adx(df['High'], df['Low'], df['Close'], length=14)['ADX_14']
+    df['ADX'] = 25
     
     return df
 

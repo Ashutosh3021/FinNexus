@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 
 from ..services.cache_service import cache_service
 
@@ -162,14 +162,21 @@ def get_technical_indicators(symbol: str, period: str = "6mo") -> Dict[str, Any]
         df["Volume"] = df["volume"]
         
         # Calculate indicators
-        df["SMA20"] = ta.sma(df["Close"], length=20)
-        df["SMA50"] = ta.sma(df["Close"], length=50)
-        df["RSI"] = ta.rsi(df["Close"], length=14)
+        df["SMA20"] = df["Close"].rolling(window=20).mean()
+        df["SMA50"] = df["Close"].rolling(window=50).mean()
         
-        macd = ta.macd(df["Close"], fast=12, slow=26, signal=9)
-        if macd is not None:
-            df["MACD"] = macd["MACD_12_26_9"]
-            df["MACD_signal"] = macd["MACDs_12_26_9"]
+        # RSI
+        delta = df["Close"].diff()
+        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+        loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
+        rs = gain / loss
+        df["RSI"] = 100 - (100 / (1 + rs))
+        
+        # MACD
+        ema12 = df["Close"].ewm(span=12).mean()
+        ema26 = df["Close"].ewm(span=26).mean()
+        df["MACD"] = ema12 - ema26
+        df["MACD_signal"] = df["MACD"].ewm(span=9).mean()
         
         latest = df.iloc[-1]
         

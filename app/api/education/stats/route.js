@@ -1,23 +1,31 @@
 export async function GET() {
+  const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+
   try {
-    const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 3000)
+
     const res = await fetch(`${backendUrl}/education/stats`, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' },
-    });
+      signal: controller.signal
+    })
+    clearTimeout(timeout)
 
-    if (!res.ok) {
-      console.warn('Backend returned non-OK status for /education/stats', res.status);
-      return Response.json({ success: false, data: { total_documents: 0, topics_covered: [], levels_covered: [] }, error: 'Backend unavailable' }, { status: 200 });
-    }
+    if (!res.ok) throw new Error(`Backend error: ${res.status}`)
+    const data = await res.json()
+    return Response.json({ success: true, data, source: 'backend' })
 
-    const data = await res.json();
-    return Response.json(data, { status: 200 });
   } catch (error) {
-    console.error('Error fetching stats:', error);
-    return Response.json(
-      { success: false, error: 'Failed to fetch stats' },
-      { status: 500 }
-    );
+    console.warn(`[API] Backend unavailable, using mock data: ${error.message}`)
+    return Response.json({
+      success: true,
+      data: getMockData(),
+      source: 'mock'
+    })
   }
+}
+
+function getMockData() {
+  return { total_documents: 6, topics_covered: ['Stocks','Technical Analysis','Portfolio'], levels_covered: ['BEGINNER','INTERMEDIATE'] }
 }

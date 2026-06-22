@@ -1,11 +1,11 @@
-name,symbol,category,status,rows,coingecko_id,ccxt_symbol,yfinance_symbol,date_range_start,date_range_end
-Bitcoin,BTC,Store of Value,Failed,0,bitcoin,BTC/USDT,BTC-USD,2024-01-01,2026-06-22
-Ethereum,ETH,Smart Contract,Failed,0,ethereum,ETH/USDT,ETH-USD,2024-01-01,2026-06-22
-Solana,SOL,Smart Contract,Failed,0,solana,SOL/USDT,SOL-USD,2024-01-01,2026-06-22
-BNB,BNB,Exchange/Utility,Failed,0,binancecoin,BNB/USDT,BNB-USD,2024-01-01,2026-06-22
-TRON,TRX,Payments/Stable,Failed,0,tron,TRX/USDT,TRX-USD,2024-01-01,2026-06-22
-Monero,XMR,Privacy,Failed,0,monero,XMR/USDT,XMR-USD,2024-01-01,2026-06-22
-Litecoin,LTC,Payments,Failed,0,litecoin,LTC/USDT,LTC-USD,2024-01-01,2026-06-22
-Hyperliquid,HYPE,DeFi/Perps,Failed,0,hyperliquid,HYPE/USDT,,2024-01-01,2026-06-22
-Uniswap,UNI,DeFi/Exchange,Failed,0,uniswap,UNI/USDT,UNI-USD,2024-01-01,2026-06-22
-Worldcoin,WLD,AI,Success,904,worldcoin,WLD/USDT,,2024-01-01,2026-06-22
+name,symbol,category,status,rows,start_date,end_date
+Bitcoin,BTC,Store of Value,Success,904,2024-01-01,2026-06-22
+Ethereum,ETH,Smart Contract,Success,904,2024-01-01,2026-06-22
+Solana,SOL,Smart Contract,Success,904,2024-01-01,2026-06-22
+BNB,BNB,Exchange/Utility,Success,904,2024-01-01,2026-06-22
+TRON,TRX,Payments/Stable,Success,904,2024-01-01,2026-06-22
+Monero,XMR,Privacy,Success,903,2024-01-01,2026-06-22
+Litecoin,LTC,Payments,Success,904,2024-01-01,2026-06-22
+Uniswap,UNI,DeFi/Exchange,Success,904,2024-01-01,2026-06-22
+Worldcoin,WLD,AI,Success,904,2024-01-01,2026-06-22
+Bittensor,TAO,AI/DeFi,Success,803,2024-01-01,2026-06-22

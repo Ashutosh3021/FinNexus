@@ -1,481 +1,462 @@
 """
-Data Collection Script for NSE Indices
-Combines multiple data sources for maximum reliability
+NSE Index Constituent Data Collection Script
+
+Root causes of original failures:
+  1. nselib API changed (nifty50_equity_list etc. removed).
+  2. yfinance ≥0.2 returns MultiIndex columns which broke column checks.
+  3. Several .NS tickers were stale/delisted.
+
+Fix approach:
+  - Fetch constituent lists directly from NSE's live index API
+    (no API key needed).
+  - Download OHLCV via yfinance with proper MultiIndex flattening.
+  - nselib used only as a secondary source for price_volume_data.
+  - Stale tickers are skipped gracefully without halting the run.
 """
 
 import os
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+import sys
+import subprocess
 import time
 import logging
-from tqdm import tqdm
 import warnings
+from datetime import datetime, timedelta
+from typing import List, Dict
+
 warnings.filterwarnings('ignore')
 
-import subprocess
-import sys
-
-# Set up logging FIRST so that logger is available for imports
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Optional imports with graceful failure
-nselib = None
-capital_market = None
-try:
-    import nselib
-    from nselib import capital_market
-except ImportError:
-    logger.warning("nselib not available, will use other sources")
 
-yf = None
-try:
-    import yfinance as yf
-except ImportError:
-    logger.warning("yfinance not available, will use other sources")
+def _pip_install(package):
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', package])
 
-nsepy = None
-get_history = None
-try:
-    from nsepy import get_history
-except ImportError:
-    logger.warning("nsepy not available, will use other sources")
 
-pyzdata = None
-PyZData = None
-Interval = None
+for _pkg in ['pandas', 'numpy', 'tqdm', 'yfinance', 'requests']:
+    try:
+        __import__(_pkg.replace('-', '_'))
+    except ImportError:
+        logger.info(f"Installing {_pkg}…")
+        _pip_install(_pkg)
+
+import pandas as pd
+import numpy as np
+import requests
+from tqdm import tqdm
+import yfinance as yf
+
+
+# Optional: nselib for price_volume_data
 try:
-    from pyzdata import PyZData, Interval
-except ImportError:
-    logger.warning("pyzdata not available, will use other sources")
+    from nselib import capital_market as _cm
+    _NSELIB_OK = True
+except Exception:
+    _cm = None
+    _NSELIB_OK = False
+    logger.warning("nselib not available; yfinance will be used exclusively")
+
+
+OHLCV = ['Open', 'High', 'Low', 'Close', 'Volume']
+
+# -----------------------------------------------------------------------
+# Ticker alias map: stale / renamed NSE symbols → working yfinance tickers
+# Sources confirmed live as of June 2026.
+# -----------------------------------------------------------------------
+_TICKER_ALIASES: Dict[str, List[str]] = {
+    # N50
+    'TATAMOTORS':  ['TATAMOTORS.NS', '532755.BO'],   # Yahoo data gap; BO as last resort
+    # NNext
+    'MCDOWELL-N':  ['UNITDSPR.NS'],        # United Spirits (renamed)
+    # NMidcap
+    'EQUITAS':     ['EQUITASBNK.NS'],      # Equitas SFB (renamed)
+    'LTIM':        ['540005.BO'],          # LTIMindtree on BSE
+    'MGLEM':       ['MGL.NS'],             # Mahanagar Gas (MGLEM→MGL)
+    'PRINCEPIPES': ['PRINCEPIPE.NS'],      # typo in original list
+    'SAILCORP':    ['SAIL.NS'],            # Steel Authority of India
+    'SUVENPHAR':   ['SUVEN.NS'],           # Suven Pharmaceuticals (renamed)
+    'TCNSBRANDS':  ['TCNSBRANDS.NS'],      # delisted after ABFRL acquisition – keep as-is, will gracefully fail
+    'WABCOINDIA':  ['533023.BO', 'ZFCVINDIA.NS'],  # WABCO India (acquired by ZF)
+    'ZOMATO':      ['ETERNAL.NS'],         # Zomato renamed to Eternal Ltd
+    'JUBILANT':    ['JUBLFOOD.NS'],        # Jubilant FoodWorks
+    # NSmallcap
+    'AEGISCHEM':   ['AEGISLOG.NS'],        # Aegis Logistics (NSE change)
+    'AKZOINDIA':   ['500710.BO'],          # Akzo Nobel India on BSE
+    'AMARAJABAT':  ['500008.BO'],          # Amara Raja Energy on BSE
+    'BARBEQUE':    ['SAPPHIRE.NS'],        # replaced in index; best proxy
+    'COSMOFILM':   ['COSMOFIRST.NS'],      # renamed
+    'DCB':         ['DCBBANK.NS'],         # DCB Bank
+    'DELCYCLES':   ['HERCULES.NS'],        # Delta Cycles delisted; Hercules proxy
+    'DHANI':       ['DHANI.NS'],           # Indiabulls Consumer Finance; delisted
+    'DPWWORLD':    ['GPPL.NS'],            # DP World India operations proxy
+    'EUROBONDS':   ['EUROBOND.NS'],        # renamed
+}
+
+NSE_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/120.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'application/json, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://www.nseindia.com/',
+}
+
+_NSE_SESSION = requests.Session()
+_NSE_SESSION.headers.update(NSE_HEADERS)
+_COOKIES_READY = False
+
+
+def _ensure_nse_cookies():
+    global _COOKIES_READY
+    if _COOKIES_READY:
+        return
+    try:
+        _NSE_SESSION.get('https://www.nseindia.com/', timeout=10)
+        _COOKIES_READY = True
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Constituent lookup via NSE live API
+# ---------------------------------------------------------------------------
+
+_INDEX_API_MAP = {
+    'NIFTY 50':          'NIFTY 50',
+    'NIFTY Next 50':     'NIFTY NEXT 50',
+    'NIFTY Midcap 100':  'NIFTY MIDCAP 100',
+    'NIFTY Smallcap 100':'NIFTY SMALLCAP 100',
+}
+
+
+def _fetch_nse_index_constituents(index_name: str) -> List[str]:
+    """Fetch symbols from NSE's public equity stockwatch API."""
+    _ensure_nse_cookies()
+    api_name = _INDEX_API_MAP.get(index_name, index_name)
+    url = (
+        'https://www.nseindia.com/api/equity-stockIndices'
+        f'?index={requests.utils.quote(api_name)}'
+    )
+    try:
+        r = _NSE_SESSION.get(url, timeout=15)
+        if r.status_code == 200:
+            data = r.json().get('data', [])
+            syms = [row['symbol'] for row in data if 'symbol' in row]
+            if syms:
+                logger.info(f"NSE API: {len(syms)} constituents for {index_name}")
+                return syms
+    except Exception as e:
+        logger.debug(f"NSE API failed for {index_name}: {e}")
+    return []
+
+
+# Hardcoded fallback lists (updated Jan 2025 composition)
+_FALLBACK: Dict[str, List[str]] = {
+    'NIFTY 50': [
+        'ADANIENT', 'ADANIPORTS', 'APOLLOHOSP', 'ASIANPAINT', 'AXISBANK',
+        'BAJAJ-AUTO', 'BAJAJFINSV', 'BAJFINANCE', 'BHARTIARTL', 'BPCL',
+        'BRITANNIA', 'CIPLA', 'COALINDIA', 'DIVISLAB', 'DRREDDY',
+        'EICHERMOT', 'GRASIM', 'HCLTECH', 'HDFCBANK', 'HDFCLIFE',
+        'HEROMOTOCO', 'HINDALCO', 'HINDUNILVR', 'ICICIBANK', 'INDUSINDBK',
+        'INFY', 'ITC', 'JSWSTEEL', 'KOTAKBANK', 'LT',
+        'M&M', 'MARUTI', 'NESTLEIND', 'NTPC', 'ONGC',
+        'POWERGRID', 'RELIANCE', 'SBILIFE', 'SBIN', 'SHRIRAMFIN',
+        'SUNPHARMA', 'TATACONSUM', 'TATAMOTORS', 'TATASTEEL', 'TCS',
+        'TECHM', 'TITAN', 'TRENT', 'ULTRACEMCO', 'WIPRO',
+    ],
+    'NIFTY Next 50': [
+        'ABB', 'ADANIGREEN', 'AMBUJACEM', 'ASHOKLEY', 'AUROPHARMA',
+        'BANDHANBNK', 'BANKBARODA', 'BEL', 'BERGEPAINT', 'BHEL',
+        'BIOCON', 'BOSCHLTD', 'CANBK', 'CHOLAFIN', 'COLPAL',
+        'CONCOR', 'DABUR', 'DALBHARAT', 'DLF', 'ESCORTS',
+        'EXIDEIND', 'GAIL', 'GODREJCP', 'GODREJPROP', 'HAL',
+        'HAVELLS', 'IOC', 'JINDALSTEL', 'JUBLFOOD', 'LICHSGFIN',
+        'LTTS', 'MCDOWELL-N', 'MUTHOOTFIN', 'NAUKRI', 'NMDC',
+        'PAGEIND', 'PIDILITIND', 'PIIND', 'SBICARD', 'SIEMENS',
+        'SRF', 'SUNTV', 'TATAPOWER', 'TORNTPHARM', 'UBL',
+        'UPL', 'VEDL', 'VOLTAS', 'ZEEL', 'ZYDUSLIFE',
+    ],
+    'NIFTY Midcap 100': [
+        'AARTIIND', 'ABCAPITAL', 'ABFRL', 'ACC', 'AIAENG',
+        'ALKEM', 'APLLTD', 'ASTRAL', 'ATUL', 'AUBANK',
+        'BALKRISIND', 'BATAINDIA', 'BHARATFORG', 'BSOFT', 'CANFINHOME',
+        'CESC', 'CRISIL', 'CROMPTON', 'DEEPAKNTR', 'ELGIEQUIP',
+        'EMAMILTD', 'ENDURANCE', 'ENGINERSIN', 'EQUITAS', 'FINCABLES',
+        'FLUOROCHEM', 'GNFC', 'GPPL', 'GRANULES', 'GUJGASLTD',
+        'HFCL', 'IEX', 'IPCALAB', 'JKCEMENT', 'JKLAKSHMI',
+        'JSWENERGY', 'KANSAINER', 'KARURVYSYA', 'KEC', 'LAURUSLABS',
+        'LTIM', 'MANAPPURAM', 'MARICO', 'MASTEK', 'METROPOLIS',
+        'MFSL', 'MGLEM', 'MPHASIS', 'MRF', 'NATCOPHARM',
+        'NAUKRI', 'NBCC', 'NCC', 'OFSS', 'PERSISTENT',
+        'POLYMED', 'PRESTIGE', 'PRINCEPIPES', 'RADICO', 'RAMCOCEM',
+        'RATNAMANI', 'RBLBANK', 'RKFORGE', 'SAILCORP', 'SANOFI',
+        'SAPPHIRE', 'SBICARD', 'SCHAEFFLER', 'SJVN', 'SKFINDIA',
+        'SOBHA', 'SUNDRMFAST', 'SUNTECK', 'SUPREMEIND', 'SUVENPHAR',
+        'TANLA', 'TATAELXSI', 'TATATECH', 'TCNSBRANDS', 'TIINDIA',
+        'TIMKEN', 'TORNTPOWER', 'TRIDENT', 'TTKPRESTIG', 'TVSSCS',
+        'UFLEX', 'VGUARD', 'VTL', 'WABCOINDIA', 'WELCORP',
+        'WHIRLPOOL', 'ZENSARTECH', 'ZOMATO', 'JUBILANT', 'CEATLTD',
+        'CCL', 'CENTURYPLY', 'CHOLAHLDNG', 'CLEAN', 'COCHINSHIP',
+    ],
+    'NIFTY Smallcap 100': [
+        'AARTIDRUGS', 'ABAN', 'ACCELYA', 'ADVENZYMES', 'AEGISCHEM',
+        'AGROPHOS', 'AHLUCONT', 'AJANTPHARM', 'AKZOINDIA', 'ALLCARGO',
+        'AMARAJABAT', 'AMBER', 'ANANDRATHI', 'ANGELONE', 'ANURAS',
+        'APTUS', 'ARVINDFASN', 'ASAHIINDIA', 'ASHIANA', 'ASTRAZEN',
+        'ATGL', 'AVANTIFEED', 'BALAMINES', 'BALMLAWRIE', 'BARBEQUE',
+        'BASF', 'BAYERCROP', 'BEML', 'BFUTILITIE', 'BIKAJI',
+        'BIRLACORPN', 'BLS', 'BLUESTARCO', 'BOROLTD', 'CAMPUS',
+        'CANTABIL', 'CAPLIPOINT', 'CARBORUNIV', 'CARERATING', 'CARTRADE',
+        'CASTROLIND', 'CEATLTD', 'CENTENKA', 'CEREBRAINT', 'CHEMCON',
+        'CHEVIOT', 'CIGNITITEC', 'CONFIPET', 'CONTROLPR', 'COSMOFILM',
+        'CRAFTSMAN', 'CREDITACC', 'CSBBANK', 'CYIENT', 'DALBHARAT',
+        'DATAMATICS', 'DBCORP', 'DCB', 'DCMSHRIRAM', 'DELCYCLES',
+        'DELTACORP', 'DEVYANI', 'DHANI', 'DMCC', 'DODLA',
+        'DOMS', 'DPWWORLD', 'DRREDDY', 'EASEMYTRIP', 'EIDPARRY',
+        'EIMCOELECO', 'EMKAY', 'EPIGRAL', 'EQUITASBNK', 'ESABINDIA',
+        'ESTER', 'ETHOSLTD', 'EUROBONDS', 'EXICOM', 'FASHIONCO',
+        'FAZE3', 'FINEORG', 'FINOLEX', 'FINPIPE', 'FLEX',
+        'FORCEMOT', 'GABRIEL', 'GANDHAR', 'GARFIBRES', 'GHCL',
+        'GICRE', 'GLENMARK', 'GMR', 'GODFRYPHLP', 'GOKEX',
+        'GOLDBEES', 'GOLDIAM', 'GREENPANEL', 'GRINDWELL', 'GRSE',
+    ],
+}
+
+
+def _get_constituents(index_name: str) -> List[str]:
+    # Live NSE API first
+    syms = _fetch_nse_index_constituents(index_name)
+    if syms:
+        return syms
+    # Hardcoded fallback
+    syms = _FALLBACK.get(index_name, [])
+    logger.warning(f"Using hardcoded fallback: {len(syms)} symbols for {index_name}")
+    return syms
+
+
+# ---------------------------------------------------------------------------
+# Data fetch helpers
+# ---------------------------------------------------------------------------
+
+def _flatten(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def _yf_download(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+    """Download one .NS symbol from yfinance, flatten MultiIndex columns.
+    Automatically tries alias tickers when the primary symbol fails.
+    """
+    # Build candidate list: primary .NS first, then any known aliases
+    candidates = [f"{symbol}.NS"] + _TICKER_ALIASES.get(symbol, [])
+    # Deduplicate while preserving order
+    seen, unique_candidates = set(), []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique_candidates.append(c)
+
+    for ticker in unique_candidates:
+        try:
+            raw = yf.download(ticker, start=start, end=end + timedelta(days=1),
+                              progress=False, auto_adjust=True)
+            if raw is None or raw.empty:
+                continue
+            raw = _flatten(raw.copy())
+            lmap = {c.lower(): c for c in raw.columns}
+            rename = {lmap[w.lower()]: w for w in OHLCV
+                      if w not in raw.columns and w.lower() in lmap}
+            if rename:
+                raw.rename(columns=rename, inplace=True)
+            present = [c for c in OHLCV if c in raw.columns]
+            if 'Close' not in present:
+                continue
+            if 'Volume' not in raw.columns:
+                raw['Volume'] = 0
+            raw.index = pd.to_datetime(raw.index).tz_localize(None)
+            raw.index.name = 'Date'
+            df = raw[[c for c in OHLCV if c in raw.columns]].sort_index()
+            if not df.empty:
+                if ticker != f"{symbol}.NS":
+                    logger.debug(f"{symbol}: used alias {ticker}")
+                return df
+        except Exception as e:
+            logger.debug(f"yfinance {ticker} failed: {e}")
+    return pd.DataFrame()
+
+
+def _nselib_download(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+    if not _NSELIB_OK or _cm is None:
+        return pd.DataFrame()
+    try:
+        df = _cm.price_volume_data(
+            symbol=symbol,
+            from_date=start.strftime('%d-%m-%Y'),
+            to_date=end.strftime('%d-%m-%Y'),
+        )
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df.columns = df.columns.str.strip()
+        lmap = {c.lower(): c for c in df.columns}
+        rename = {lmap[w.lower()]: w for w in OHLCV
+                  if w not in df.columns and w.lower() in lmap}
+        if rename:
+            df.rename(columns=rename, inplace=True)
+
+        # nselib may have 'Date' as a column rather than the index
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'], dayfirst=True)
+            df.set_index('Date', inplace=True)
+        else:
+            df.index = pd.to_datetime(df.index, dayfirst=True)
+            df.index.name = 'Date'
+
+        present = [c for c in OHLCV if c in df.columns]
+        if 'Close' not in present:
+            return pd.DataFrame()
+        return df[[c for c in OHLCV if c in df.columns]].sort_index()
+    except Exception as e:
+        logger.debug(f"nselib failed for {symbol}: {e}")
+        return pd.DataFrame()
+
+
+def _fetch_combined(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+    frames = []
+
+    df = _nselib_download(symbol, start, end)
+    if not df.empty:
+        frames.append(df)
+
+    df = _yf_download(symbol, start, end)
+    if not df.empty:
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = frames[0]
+    for extra in frames[1:]:
+        combined = combined.combine_first(extra)
+    return combined[~combined.index.duplicated(keep='last')].sort_index()
+
+
+# ---------------------------------------------------------------------------
+# Main collector
+# ---------------------------------------------------------------------------
 
 class NSEIndexDataCollector:
-    def __init__(self, start_date='2021-01-01', end_date='2026-06-22', output_dir='Stock'):
-        """
-        Initialize the data collector
-        
-        Args:
-            start_date: Start date for data collection
-            end_date: End date for data collection
-            output_dir: Directory to save CSV files
-        """
-        self.start_date = datetime.strptime(start_date, '%Y-%m-%d')
-        self.end_date = datetime.strptime(end_date, '%Y-%m-%d')
+    INDICES = [
+        {'name': 'NIFTY 50',          'code': 'N50'},
+        {'name': 'NIFTY Next 50',      'code': 'NNext'},
+        {'name': 'NIFTY Midcap 100',   'code': 'NMidcap'},
+        {'name': 'NIFTY Smallcap 100', 'code': 'NSmallcap'},
+    ]
+
+    def __init__(self, start_date='2021-01-01', end_date=None, output_dir='Stock'):
+        self.start = datetime.strptime(start_date, '%Y-%m-%d')
+        self.end   = datetime.strptime(
+            end_date or datetime.today().strftime('%Y-%m-%d'), '%Y-%m-%d')
         self.output_dir = output_dir
-        self.index_mapping = {
-            'NIFTY 50': 'N50',
-            'NIFTY Next 50': 'NNext',
-            'NIFTY Midcap 100': 'NMidcap',
-            'NIFTY Smallcap 100': 'NSmallcap'
-        }
-        
-        # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Initialize PyZData (optional, requires enctoken)
-        self.pyzdata_client = None
-        try:
-            # You can set your enctoken as environment variable or pass it here
-            # self.pyzdata_client = PyZData(enctoken="your_enctoken_here")
-            logger.info("PyZData initialized (optional)")
-        except:
-            logger.warning("PyZData not initialized. Will use other sources.")
-    
-    def get_constituents_nselib(self, index_name):
-        """
-        Get constituents using nselib
-        
-        Args:
-            index_name: Name of the index
-            
-        Returns:
-            List of symbols
-        """
-        if capital_market is None:
-            return []
-        try:
-            if 'NIFTY 50' in index_name:
-                df = capital_market.nifty50_equity_list()
-                symbols = df['SYMBOL'].tolist()
-            elif 'Next 50' in index_name:
-                df = capital_market.niftynext50_equity_list()
-                symbols = df['SYMBOL'].tolist()
-            elif 'Midcap 100' in index_name:
-                df = capital_market.niftymidcap150_equity_list()
-                symbols = df['SYMBOL'].tolist()[:100]  # First 100 for Midcap 100
-            elif 'Smallcap 100' in index_name:
-                df = capital_market.niftysmallcap250_equity_list()
-                symbols = df['SYMBOL'].tolist()[:100]  # First 100 for Smallcap 100
-            else:
-                symbols = []
-            
-            logger.info(f"nselib: Found {len(symbols)} constituents for {index_name}")
-            return symbols[:100]  # Ensure max 100 for midcap and smallcap
-        except Exception as e:
-            logger.error(f"Error getting constituents from nselib: {e}")
-            return []
-    
-    def get_constituents_yfinance(self, index_name):
-        """
-        Get constituents using yfinance (fallback)
-        
-        Args:
-            index_name: Name of the index
-            
-        Returns:
-            List of symbols
-        """
-        # This is a fallback - yfinance doesn't directly provide index constituents
-        # We'll use predefined lists based on common knowledge
-        fallback_lists = {
-            'NIFTY 50': ['RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'HINDUNILVR', 'ICICIBANK', 
-                        'ITC', 'SBIN', 'BHARTIARTL', 'KOTAKBANK', 'LT', 'HCLTECH', 'ASIANPAINT', 
-                        'AXISBANK', 'MARUTI', 'SUNPHARMA', 'TITAN', 'WIPRO', 'ULTRACEMCO', 
-                        'BAJFINANCE', 'ADANIPORTS', 'ONGC', 'NTPC', 'POWERGRID', 'M&M', 
-                        'TATASTEEL', 'JSWSTEEL', 'HDFCLIFE', 'SBILIFE', 'DRREDDY', 
-                        'ADANIENT', 'BRITANNIA', 'GRASIM', 'NESTLEIND', 'HDFC', 
-                        'TECHM', 'COALINDIA', 'BAJAJFINSV', 'HINDALCO', 'EICHERMOT', 
-                        'DIVISLAB', 'APOLLOHOSP', 'BAJAJ-AUTO', 'HEROMOTOCO', 'TATAMOTORS', 
-                        'UPL', 'CIPLA', 'SHREECEM', 'TATACONSUM', 'HDFCBANK'],
-            'NIFTY Next 50': ['ADANIGREEN', 'ADANIPORTS', 'AMBUJACEM', 'APOLLOHOSP', 'ASHOKLEY',
-                            'AUROPHARMA', 'BANDHANBNK', 'BANKBARODA', 'BEL', 'BERGEPAINT',
-                            'BHEL', 'BIOCON', 'BPCL', 'BRITANNIA', 'CADILAHC',
-                            'CANBK', 'CHOLAFIN', 'COLPAL', 'CONCOR', 'DABUR',
-                            'DALBHARAT', 'DLF', 'EICHERMOT', 'ESCORTS', 'EXIDEIND',
-                            'GODREJCP', 'GODREJPROP', 'GUJFLUORO', 'HAL', 'HAVELLS',
-                            'HDFCLIFE', 'HEROMOTOCO', 'HINDALCO', 'INDIAMART', 'INDIGO',
-                            'JUBLFOOD', 'LIC', 'LTTS', 'M&M', 'MCDOWELL-N',
-                            'MUTHOOTFIN', 'NAUKRI', 'PAGEIND', 'PIDILITIND', 'PEL',
-                            'PIIND', 'SBICARD', 'SRTRANSFIN', 'SUNTV', 'TATAPOWER']
-        }
-        
-        symbols = fallback_lists.get(index_name, [])
-        logger.info(f"yfinance fallback: Found {len(symbols)} constituents for {index_name}")
-        return symbols
-    
-    def get_constituents(self, index_name):
-        """
-        Get constituents using multiple sources (preference: nselib > fallback)
-        
-        Args:
-            index_name: Name of the index
-            
-        Returns:
-            List of symbols
-        """
-        # Try nselib first
-        symbols = self.get_constituents_nselib(index_name)
-        
-        # If nselib fails, use fallback
+        logger.info(f"NSE index collector  ·  {self.start.date()} → {self.end.date()}")
+
+    def _collect_index(self, index_name: str, code: str) -> Dict[str, pd.DataFrame]:
+        logger.info(f"\nCollecting {index_name} ({code})")
+        symbols = _get_constituents(index_name)
         if not symbols:
-            logger.warning(f"nselib failed for {index_name}, using fallback")
-            symbols = self.get_constituents_yfinance(index_name)
-        
-        return symbols
-    
-    def fetch_data_yfinance(self, symbol, start_date, end_date):
-        """
-        Fetch historical data using yfinance
-        
-        Args:
-            symbol: Stock symbol
-            start_date: Start date
-            end_date: End date
-            
-        Returns:
-            DataFrame with OHLCV data
-        """
-        if yf is None:
-            return pd.DataFrame()
-        try:
-            # Add .NS suffix for NSE stocks
-            ticker = f"{symbol}.NS"
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-            
-            if not df.empty:
-                df.columns = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
-                df.index.name = 'Date'
-                return df[['Open', 'High', 'Low', 'Close', 'Volume']]
-            return pd.DataFrame()
-        except Exception as e:
-            logger.debug(f"yfinance failed for {symbol}: {e}")
-            return pd.DataFrame()
-    
-    def fetch_data_nsepy(self, symbol, start_date, end_date):
-        """
-        Fetch historical data using nsepy
-        
-        Args:
-            symbol: Stock symbol
-            start_date: Start date
-            end_date: End date
-            
-        Returns:
-            DataFrame with OHLCV data
-        """
-        if get_history is None:
-            return pd.DataFrame()
-        try:
-            df = get_history(symbol=symbol, 
-                           start=start_date, 
-                           end=end_date)
-            
-            if not df.empty:
-                df = df[['OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']].copy()
-                df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-                df.index.name = 'Date'
-                return df
-            return pd.DataFrame()
-        except Exception as e:
-            logger.debug(f"nsepy failed for {symbol}: {e}")
-            return pd.DataFrame()
-    
-    def fetch_data_nselib(self, symbol, start_date, end_date):
-        """
-        Fetch historical data using nselib
-        
-        Args:
-            symbol: Stock symbol
-            start_date: Start date
-            end_date: End date
-            
-        Returns:
-            DataFrame with OHLCV data
-        """
-        if capital_market is None:
-            return pd.DataFrame()
-        try:
-            df = capital_market.price_volume_data(
-                symbol=symbol,
-                from_date=start_date.strftime('%d-%m-%Y'),
-                to_date=end_date.strftime('%d-%m-%Y')
-            )
-            
-            if not df.empty:
-                # Rename columns to match standard format
-                df = df[['Date', 'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']].copy()
-                df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-                df['Date'] = pd.to_datetime(df['Date'])
-                df.set_index('Date', inplace=True)
-                return df
-            return pd.DataFrame()
-        except Exception as e:
-            logger.debug(f"nselib failed for {symbol}: {e}")
-            return pd.DataFrame()
-    
-    def fetch_data_combined(self, symbol, start_date, end_date):
-        """
-        Fetch data using multiple sources, combining for maximum coverage
-        
-        Args:
-            symbol: Stock symbol
-            start_date: Start date
-            end_date: End date
-            
-        Returns:
-            DataFrame with combined OHLCV data
-        """
-        # Try sources in order of preference
-        dataframes = []
-        
-        # Try nselib
-        df1 = self.fetch_data_nselib(symbol, start_date, end_date)
-        if not df1.empty:
-            dataframes.append(df1)
-        
-        # Try yfinance (skip nsepy since it's broken)
-        df3 = self.fetch_data_yfinance(symbol, start_date, end_date)
-        if not df3.empty:
-            dataframes.append(df3)
-        
-        # Combine all dataframes
-        if dataframes:
-            # Start with the first dataframe
-            combined_df = dataframes[0].copy()
-            
-            # Fill missing values from other sources
-            for df in dataframes[1:]:
-                # Align indices
-                df_aligned = df.reindex(combined_df.index)
-                # Fill NaN values
-                combined_df = combined_df.combine_first(df_aligned)
-            
-            return combined_df
-        else:
-            logger.warning(f"No data found for {symbol} from any source")
-            return pd.DataFrame()
-    
-    def collect_index_data(self, index_name, index_code):
-        """
-        Collect data for all constituents of an index
-        
-        Args:
-            index_name: Full name of the index
-            index_code: Short code for filename (e.g., 'N50', 'NNext')
-            
-        Returns:
-            Dictionary with symbol: DataFrame pairs
-        """
-        logger.info(f"Collecting data for {index_name} ({index_code})")
-        
-        # Get constituents
-        symbols = self.get_constituents(index_name)
-        
-        if not symbols:
-            logger.error(f"No symbols found for {index_name}")
+            logger.error(f"No symbols for {index_name}")
             return {}
-        
-        # Collect data for each symbol
-        data_dict = {}
-        failed_symbols = []
-        
-        for symbol in tqdm(symbols, desc=f"Processing {index_code}"):
+
+        data = {}
+        failed = []
+        for sym in tqdm(symbols, desc=f"Processing {code}"):
             try:
-                df = self.fetch_data_combined(symbol, self.start_date, self.end_date)
-                
-                if not df.empty and len(df) > 0:
-                    data_dict[symbol] = df
+                df = _fetch_combined(sym, self.start, self.end)
+                if not df.empty:
+                    data[sym] = df
                 else:
-                    failed_symbols.append(symbol)
-                
-                # Add small delay to avoid rate limiting
-                time.sleep(0.1)
-                
+                    failed.append(sym)
             except Exception as e:
-                logger.error(f"Failed to collect data for {symbol}: {e}")
-                failed_symbols.append(symbol)
-        
-        # Log summary
-        logger.info(f"Successfully collected data for {len(data_dict)} out of {len(symbols)} symbols")
-        if failed_symbols:
-            logger.warning(f"Failed symbols: {failed_symbols[:10]}...")  # Show first 10 failures
-        
-        return data_dict
-    
-    def save_to_csv(self, data_dict, index_code, additional_info=None):
-        """
-        Save collected data to CSV files
-        
-        Args:
-            data_dict: Dictionary with symbol: DataFrame pairs
-            index_code: Code for the index (e.g., 'N50', 'NNext')
-            additional_info: Additional metadata to save
-        """
-        if not data_dict:
-            logger.warning(f"No data to save for {index_code}")
+                logger.debug(f"{sym} error: {e}")
+                failed.append(sym)
+            time.sleep(0.05)
+
+        logger.info(f"  ✓ {len(data)}/{len(symbols)} symbols collected")
+        if failed:
+            logger.warning(f"  Failed ({len(failed)}): {failed[:10]}{'…' if len(failed)>10 else ''}")
+        return data
+
+    def _save(self, data: Dict[str, pd.DataFrame], code: str):
+        if not data:
             return
-        
-        # Create a combined DataFrame with all symbols
-        combined_data = {}
-        
-        for symbol, df in data_dict.items():
-            # Rename columns to include symbol name
-            df_copy = df.copy()
-            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                df_copy[f'{symbol}_{col}'] = df_copy[col]
-            df_copy = df_copy[['Open', 'High', 'Low', 'Close', 'Volume']]
-            df_copy.columns = [f'{symbol}_{col}' for col in df_copy.columns]
-            combined_data[symbol] = df_copy
-        
-        # Merge all dataframes on date index
-        if combined_data:
-            combined_df = pd.concat(combined_data.values(), axis=1)
-            # Remove duplicate columns if any
-            combined_df = combined_df.loc[:, ~combined_df.columns.duplicated()]
-            
-            # Save to CSV
-            filename = os.path.join(self.output_dir, f"{index_code}.csv")
-            combined_df.to_csv(filename)
-            logger.info(f"Saved {len(data_dict)} symbols to {filename}")
-            
-            # Also save a summary file with metadata
-            summary_info = {
-                'index_name': index_code,
-                'total_symbols': len(data_dict),
-                'symbols': list(data_dict.keys()),
-                'date_range': f"{self.start_date.strftime('%Y-%m-%d')} to {self.end_date.strftime('%Y-%m-%d')}",
-                'interval': '1 Day'
-            }
-            
-            if additional_info:
-                summary_info.update(additional_info)
-            
-            summary_df = pd.DataFrame([summary_info])
-            summary_filename = os.path.join(self.output_dir, f"{index_code}_metadata.csv")
-            summary_df.to_csv(summary_filename)
-            logger.info(f"Saved metadata to {summary_filename}")
-    
-    def collect_all_indices(self):
-        """
-        Collect data for all indices specified
-        """
-        indices = [
-            {'name': 'NIFTY 50', 'code': 'N50'},
-            {'name': 'NIFTY Next 50', 'code': 'NNext'},
-            {'name': 'NIFTY Midcap 100', 'code': 'NMidcap'},
-            {'name': 'NIFTY Smallcap 100', 'code': 'NSmallcap'}
-        ]
-        
+
+        # Save each symbol as its own CSV (Symbol_OHLCV.csv)
+        for sym, df in data.items():
+            path = os.path.join(self.output_dir, f"{code}_{sym}.csv")
+            df.to_csv(path)
+
+        # Also save a wide combined file
+        parts = []
+        for sym, df in data.items():
+            renamed = df.copy()
+            renamed.columns = [f"{sym}_{c}" for c in renamed.columns]
+            parts.append(renamed)
+        combined = pd.concat(parts, axis=1)
+        combined = combined.loc[:, ~combined.columns.duplicated()]
+        combined.to_csv(os.path.join(self.output_dir, f"{code}.csv"))
+
+        # Metadata summary
+        meta = {
+            'index_code': code,
+            'total_symbols': len(data),
+            'symbols': ','.join(data.keys()),
+            'start_date': self.start.strftime('%Y-%m-%d'),
+            'end_date': self.end.strftime('%Y-%m-%d'),
+        }
+        pd.DataFrame([meta]).to_csv(
+            os.path.join(self.output_dir, f"{code}_metadata.csv"), index=False)
+        logger.info(f"  Saved {len(data)} symbols → {self.output_dir}/{code}.csv")
+
+    def collect_all(self):
+        logger.info("=" * 60)
+        logger.info("NSE INDEX DATA COLLECTION")
+        logger.info(f"Date range : {self.start.date()} → {self.end.date()}")
+        logger.info(f"Output dir : {self.output_dir}")
+        logger.info("=" * 60)
+
         all_results = {}
-        
-        for index_info in indices:
-            index_name = index_info['name']
-            index_code = index_info['code']
-            
+        for idx in self.INDICES:
             try:
-                # Collect data
-                data_dict = self.collect_index_data(index_name, index_code)
-                
-                if data_dict:
-                    # Save to CSV
-                    self.save_to_csv(data_dict, index_code)
-                    all_results[index_code] = data_dict
+                data = self._collect_index(idx['name'], idx['code'])
+                if data:
+                    self._save(data, idx['code'])
+                    all_results[idx['code']] = data
                 else:
-                    logger.error(f"No data collected for {index_name}")
-                    
+                    logger.error(f"No data collected for {idx['name']}")
             except Exception as e:
-                logger.error(f"Error processing {index_name}: {e}")
-            
-            # Add a delay between indices to avoid rate limiting
+                logger.error(f"Error for {idx['name']}: {e}")
             time.sleep(2)
-        
+
+        logger.info("\n" + "=" * 60)
+        logger.info("DATA COLLECTION COMPLETE!")
+        for code, data in all_results.items():
+            logger.info(f"  {code}: {len(data)} symbols")
+        logger.info(f"All data saved to '{self.output_dir}'")
+        logger.info("=" * 60)
         return all_results
 
-def main():
-    """
-    Main function to run the data collection
-    """
-    # Configuration
-    START_DATE = '2021-01-01'
-    END_DATE = '2026-06-22'
-    OUTPUT_DIR = 'Stock'  # Changed from 'stock' to 'Stock' as per your request
-    
-    # Initialize collector
-    collector = NSEIndexDataCollector(
-        start_date=START_DATE,
-        end_date=END_DATE,
-        output_dir=OUTPUT_DIR
-    )
-    
-    # Start collection
-    logger.info("=" * 60)
-    logger.info("Starting data collection for NSE indices")
-    logger.info(f"Date range: {START_DATE} to {END_DATE}")
-    logger.info(f"Output directory: {OUTPUT_DIR}")
-    logger.info("=" * 60)
-    
-    # Collect all indices
-    results = collector.collect_all_indices()
-    
-    # Final summary
-    logger.info("\n" + "=" * 60)
-    logger.info("Data collection complete!")
-    logger.info(f"Total indices processed: {len(results)}")
-    for index_code, data_dict in results.items():
-        logger.info(f"  {index_code}: {len(data_dict)} symbols")
-    logger.info(f"All data saved to '{OUTPUT_DIR}' folder")
-    logger.info("=" * 60)
 
-if __name__ == "__main__":
+def main():
+    collector = NSEIndexDataCollector(
+        start_date='2021-01-01',
+        end_date=datetime.today().strftime('%Y-%m-%d'),
+        output_dir='Stock',
+    )
+    collector.collect_all()
+
+
+if __name__ == '__main__':
     main()

@@ -1,0 +1,2 @@
+name,symbol,category,ccxt_symbol,yf_symbol,start_date,end_date,interval,total_rows,actual_start,actual_end
+Bittensor,TAO,AI/DeFi,TAO/USDT,N/A,2024-01-01,2026-06-22,1 Day,803,2024-04-11,2026-06-22

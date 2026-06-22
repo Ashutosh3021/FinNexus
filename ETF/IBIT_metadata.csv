@@ -1,0 +1,2 @@
+symbol,name,category,start_date,end_date,interval,total_rows,actual_start,actual_end,data_completeness
+IBIT,iShares Bitcoin Trust,Alternatives,2021-01-01,2026-06-22,1 Day,611,2024-01-11,2026-06-18,30.6%

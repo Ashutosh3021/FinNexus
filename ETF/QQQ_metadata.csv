@@ -1,0 +1,2 @@
+symbol,name,category,start_date,end_date,interval,total_rows,actual_start,actual_end,data_completeness
+QQQ,Invesco QQQ Trust,Large Cap,2021-01-01,2026-06-22,1 Day,1371,2021-01-04,2026-06-18,68.6%

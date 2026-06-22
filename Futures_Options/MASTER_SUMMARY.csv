@@ -1,13 +1,11 @@
-asset_name,type,symbol,status,rows
-NIFTY_50_Futures,Futures,NIFTY,Failed,0
-BANK_NIFTY_Futures,Futures,BANKNIFTY,Failed,0
-FINNIFTY_Futures,Futures,FINNIFTY,Failed,0
-HDFC_BANK_Futures,Futures,HDFCBANK,Failed,0
-RELIANCE_Futures,Futures,RELIANCE,Failed,0
-INFOSYS_Futures,Futures,INFY,Failed,0
-NIFTY_50_Options,Options,NIFTY,Failed,0
-BANK_NIFTY_Options,Options,BANKNIFTY,Failed,0
-FINNIFTY_Options,Options,FINNIFTY,Failed,0
-BRIGADE_Options,Options,BRIGADE,Failed,0
-WTI_Oil_Options,Commodity Options,WTI,Not Collected (MCX data required),0
-Brent_Oil_Options,Commodity Options,BRENT,Not Collected (MCX data required),0
+asset,type,symbol,status,rows
+NIFTY_50_Futures,Futures,NIFTY,Success,609
+BANK_NIFTY_Futures,Futures,BANKNIFTY,Success,608
+FINNIFTY_Futures,Futures,FINNIFTY,Success,604
+HDFC_BANK_Futures,Futures,HDFCBANK,Success,612
+RELIANCE_Futures,Futures,RELIANCE,Success,612
+INFOSYS_Futures,Futures,INFY,Success,612
+NIFTY_50_Options,Options,NIFTY,Success,609
+BANK_NIFTY_Options,Options,BANKNIFTY,Success,608
+FINNIFTY_Options,Options,FINNIFTY,Success,604
+BRIGADE_Options,Options,BRIGADE,Success,612

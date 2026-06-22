@@ -1,2 +1,2 @@
-name,symbol,category,coingecko_id,ccxt_symbol,yfinance_symbol,start_date,end_date,interval,total_rows,date_range_start,date_range_end,data_completeness
-Solana,SOL,Smart Contract,solana,SOL/USDT,SOL-USD,2024-01-01,2026-06-22,1 Day,904,2024-01-01,2026-06-22,1.0011074197120708
+name,symbol,category,ccxt_symbol,yf_symbol,start_date,end_date,interval,total_rows,actual_start,actual_end
+Solana,SOL,Smart Contract,SOL/USDT,SOL-USD,2024-01-01,2026-06-22,1 Day,904,2024-01-01,2026-06-22

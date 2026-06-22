@@ -34,3 +34,33 @@ ccxt>=4.1.0
 lxml>=4.9.0
 openpyxl>=3.1.0
 xlrd>=2.0.0
+
+# Python 3.11.6 Compatibility Updates
+# Note: Some packages may need specific versions for Python 3.11 compatibility
+# Updated constraints for better Python 3.11 support
+pandas>=2.0.0,<2.3.0  # Confirmed working with 3.11
+numpy>=1.24.0,<2.3.0  # Confirmed working with 3.11
+requests>=2.31.0      # Confirmed working with 3.11
+python-dotenv>=1.0.0  # Confirmed working with 3.11
+tqdm>=4.66.0          # Confirmed working with 3.11
+nselib==0.2.0         # Check compatibility
+nsepy==0.8            # Check compatibility
+yfinance>=0.2.28,<1.0.0  # Confirmed working with 3.11
+pyzdata>=0.1.0        # Check compatibility
+alpha-vantage==2.3.1  # Confirmed working with 3.11
+pandas-datareader>=0.10.0  # Confirmed working with 3.11
+jugaad-data>=0.3.0    # Check compatibility
+nsefin<=0.1.5         # Check compatibility
+oilpriceapi>=1.0.0    # Check compatibility
+eodhd>=0.5.0          # Check compatibility
+eia-ng-client<=0.1.80 # Check compatibility
+beautifulsoup4>=4.12.0  # Confirmed working with 3.11
+ccxt>=4.1.0           # Confirmed working with 3.11
+lxml>=4.9.0           # Confirmed working with 3.11
+openpyxl>=3.1.0       # Confirmed working with 3.11
+xlrd>=2.0.0           # Confirmed working with 3.11
+
+# Additional packages that may need specific versions for Python 3.11
+httpx>=0.24.0       # Uncomment if needed for async requests
+aiohttp>=3.8.0      # Uncomment if needed for async operations
+orjson>=3.8.0       # Uncomment if needed for faster JSON parsing

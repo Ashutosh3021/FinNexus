@@ -35,38 +35,38 @@ for pkg in required_packages:
 
 # Import libraries with fallback installation
 try:
-    from jugaad_data.nse import stock_df, index_df, derivative_chain, NSELive
+    from jugaad_data.nse import stock_df, index_df, NSELive, expiry_dates
 except ImportError:
     logger.info("Installing jugaad-data...")
-    os.system('pip install jugaad-data')
-    from jugaad_data.nse import stock_df, index_df, derivative_chain, NSELive
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "jugaad-data"])
+    from jugaad_data.nse import stock_df, index_df, NSELive, expiry_dates
 
+# Optional imports with graceful failure
+ns = None
 try:
     import nsefetch as ns
 except ImportError:
-    logger.info("Installing nsefetch...")
-    os.system('pip install nsefetch')
-    import nsefetch as ns
+    logger.warning("nsefetch not available, will skip this source")
 
+nsefin = None
+FnO = None
+OptionChain = None
 try:
     import nsefin
     from nsefin import FnO, OptionChain
 except ImportError:
-    logger.info("Installing nsefin...")
-    os.system('pip install nsefin')
-    import nsefin
-    from nsefin import FnO, OptionChain
+    logger.warning("nsefin not available, will skip this source")
 
+nsepy = None
+get_history = None
+get_futures_data = None
+get_option_data = None
 try:
     import nsepy
     from nsepy import get_history
     from nsepy.derivatives import get_futures_data, get_option_data
 except ImportError:
-    logger.info("Installing nsepy...")
-    os.system('pip install nsepy')
-    import nsepy
-    from nsepy import get_history
-    from nsepy.derivatives import get_futures_data, get_option_data
+    logger.warning("nsepy not available, will skip this source")
 
 class NSFuturesOptionsCollector:
     def __init__(self, start_date='2024-01-01', end_date='2026-06-22', output_dir='Futures_Options'):
@@ -171,12 +171,9 @@ class NSFuturesOptionsCollector:
             List of expiry dates
         """
         try:
-            # Using jugaad-data to get expiry dates
-            from datetime import datetime as dt
-            # Try to get derivative chain
-            chain = derivative_chain(symbol=symbol)
-            if chain is not None:
-                expiries = chain.index.get_level_values('Expiry').unique().tolist()
+            # Using jugaad-data's expiry_dates
+            expiries = expiry_dates(symbol)
+            if expiries:
                 expiries = [e for e in expiries if e >= self.start_date and e <= self.end_date]
                 return sorted(expiries)
             return []
@@ -210,21 +207,9 @@ class NSFuturesOptionsCollector:
         Returns:
             DataFrame with futures data
         """
-        try:
-            # Using derivative_chain from jugaad
-            chain = derivative_chain(symbol=symbol, expiry=expiry_date)
-            if chain is not None:
-                # Filter for futures contracts
-                futures_data = chain[chain['Instrument'] == 'FUTIDX']
-                if not futures_data.empty:
-                    # Get OHLC data
-                    ohlc_data = futures_data[['Open', 'High', 'Low', 'Close', 'Volume', 'Open Interest']].copy()
-                    ohlc_data.index = pd.to_datetime(chain.index)
-                    return ohlc_data
-            return pd.DataFrame()
-        except Exception as e:
-            logger.debug(f"jugaad-data futures failed for {symbol}: {e}")
-            return pd.DataFrame()
+        # jugaad-data's derivatives_df doesn't support OHLC for specific expiries
+        # Just return empty dataframe and rely on other sources
+        return pd.DataFrame()
     
     def fetch_futures_nsefetch(self, symbol, expiry_date):
         """
@@ -237,6 +222,8 @@ class NSFuturesOptionsCollector:
         Returns:
             DataFrame with futures data
         """
+        if ns is None:
+            return pd.DataFrame()
         try:
             # Using nsefetch's get_futures_data
             data = ns.get_futures_data(symbol=symbol, expiry=expiry_date)
@@ -250,7 +237,7 @@ class NSFuturesOptionsCollector:
         except Exception as e:
             logger.debug(f"nsefetch futures failed for {symbol}: {e}")
             return pd.DataFrame()
-    
+
     def fetch_futures_nsefin(self, symbol, expiry_date):
         """
         Fetch futures data using nsefin
@@ -262,6 +249,8 @@ class NSFuturesOptionsCollector:
         Returns:
             DataFrame with futures data
         """
+        if nsefin is None or FnO is None:
+            return pd.DataFrame()
         try:
             fno = FnO()
             data = fno.get_futures(symbol=symbol, expiry=expiry_date)
@@ -276,7 +265,7 @@ class NSFuturesOptionsCollector:
         except Exception as e:
             logger.debug(f"nsefin futures failed for {symbol}: {e}")
             return pd.DataFrame()
-    
+
     def fetch_futures_nsepy(self, symbol, expiry_date):
         """
         Fetch futures data using nsepy
@@ -288,6 +277,8 @@ class NSFuturesOptionsCollector:
         Returns:
             DataFrame with futures data
         """
+        if nsepy is None or get_futures_data is None:
+            return pd.DataFrame()
         try:
             data = get_futures_data(
                 symbol=symbol,
@@ -364,26 +355,9 @@ class NSFuturesOptionsCollector:
         Returns:
             DataFrame with options data
         """
-        try:
-            chain = derivative_chain(symbol=symbol, expiry=expiry_date)
-            if chain is not None:
-                # Filter for options contracts
-                options_data = chain[chain['Instrument'].str.contains('OPT', na=False)]
-                if not options_data.empty:
-                    # Filter by option type if specified
-                    if option_type:
-                        options_data = options_data[options_data['Option Type'] == option_type]
-                    # Filter by strike if specified
-                    if strike_price:
-                        options_data = options_data[options_data['Strike Price'] == strike_price]
-                    
-                    ohlc_data = options_data[['Open', 'High', 'Low', 'Close', 'Volume', 'Open Interest']].copy()
-                    ohlc_data.index = pd.to_datetime(chain.index)
-                    return ohlc_data
-            return pd.DataFrame()
-        except Exception as e:
-            logger.debug(f"jugaad-data options failed for {symbol}: {e}")
-            return pd.DataFrame()
+        # jugaad-data's derivatives_df doesn't support OHLC for specific expiries
+        # Just return empty dataframe and rely on other sources
+        return pd.DataFrame()
     
     def fetch_options_nsefetch(self, symbol, expiry_date, option_type=None, strike_price=None):
         """
@@ -398,6 +372,8 @@ class NSFuturesOptionsCollector:
         Returns:
             DataFrame with options data
         """
+        if ns is None:
+            return pd.DataFrame()
         try:
             data = ns.get_option_chain(symbol=symbol, expiry=expiry_date)
             if data is not None and not data.empty:
@@ -416,7 +392,7 @@ class NSFuturesOptionsCollector:
         except Exception as e:
             logger.debug(f"nsefetch options failed for {symbol}: {e}")
             return pd.DataFrame()
-    
+
     def fetch_options_nsefin(self, symbol, expiry_date, option_type=None, strike_price=None):
         """
         Fetch options data using nsefin
@@ -430,6 +406,8 @@ class NSFuturesOptionsCollector:
         Returns:
             DataFrame with options data
         """
+        if nsefin is None or OptionChain is None:
+            return pd.DataFrame()
         try:
             option_chain = OptionChain(symbol=symbol)
             data = option_chain.get_options(expiry=expiry_date)

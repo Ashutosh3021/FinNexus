@@ -35,11 +35,11 @@ for pkg in required_packages:
 
 # Import libraries with fallback installation
 try:
-    from ml4t_data import CryptoDataProvider
+    from ml4t.data.providers import CoinGeckoProvider
 except ImportError:
     logger.info("Installing ml4t-data...")
     os.system('pip install ml4t-data')
-    from ml4t_data import CryptoDataProvider
+    from ml4t.data.providers import CoinGeckoProvider
 
 try:
     import ccxt
@@ -161,7 +161,7 @@ class CryptoDataCollector:
         """Initialize data providers"""
         try:
             # Initialize CoinGecko via ml4t-data
-            self.coingecko_provider = CryptoDataProvider(provider='coingecko')
+            self.coingecko_provider = CoinGeckoProvider()
             logger.info("✓ CoinGecko provider initialized")
         except Exception as e:
             logger.warning(f"CoinGecko initialization failed: {e}")
@@ -201,28 +201,29 @@ class CryptoDataCollector:
             coin_id = crypto_info['coingecko_id']
             
             # Get historical data
-            df = self.coingecko_provider.get_historical_ohlcv(
+            df = self.coingecko_provider.fetch_ohlcv(
                 symbol=coin_id,
-                days=(end_date - start_date).days,
-                vs_currency='usd',
-                interval='daily'
+                start=start_date.strftime('%Y-%m-%d'),
+                end=end_date.strftime('%Y-%m-%d'),
+                frequency='daily'
             )
             
-            if df is not None and not df.empty:
+            if df is not None and not df.is_empty():
+                # Convert polars DataFrame to pandas
+                df_pd = df.to_pandas()
+                
                 # Standardize columns
-                if isinstance(df, pd.DataFrame):
-                    # ml4t-data returns DataFrame with columns: timestamp, open, high, low, close, volume
-                    df.columns = ['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
-                    df['Date'] = pd.to_datetime(df['timestamp'], unit='ms')
-                    df.set_index('Date', inplace=True)
-                    df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-                    
-                    # Filter by date range
-                    mask = (df.index >= start_date) & (df.index <= end_date)
-                    df = df.loc[mask]
-                    
-                    logger.debug(f"CoinGecko: Retrieved {len(df)} rows for {crypto_info['symbol']}")
-                    return df
+                df_pd.columns = ['timestamp', 'symbol', 'Open', 'High', 'Low', 'Close', 'Volume']
+                df_pd['Date'] = pd.to_datetime(df_pd['timestamp'], unit='ms')
+                df_pd.set_index('Date', inplace=True)
+                df_pd = df_pd[['Open', 'High', 'Low', 'Close', 'Volume']]
+                
+                # Filter by date range
+                mask = (df_pd.index >= start_date) & (df_pd.index <= end_date)
+                df_pd = df_pd.loc[mask]
+                
+                logger.debug(f"CoinGecko: Retrieved {len(df_pd)} rows for {crypto_info['symbol']}")
+                return df_pd
             
             return pd.DataFrame()
         except Exception as e:

@@ -1,0 +1,16 @@
+symbol,name,category,status,rows,date_range_start,date_range_end
+SPY,SPDR S&P 500 ETF,Large Cap,Failed,0,2021-01-01,2026-06-22
+QQQ,Invesco QQQ Trust,Large Cap,Failed,0,2021-01-01,2026-06-22
+IVV,iShares Core S&P 500 ETF,Large Cap,Failed,0,2021-01-01,2026-06-22
+XLK,Technology Select Sector SPDR,Sector,Failed,0,2021-01-01,2026-06-22
+XLE,Energy Select Sector SPDR,Sector,Failed,0,2021-01-01,2026-06-22
+XLV,Health Care Select Sector SPDR,Sector,Failed,0,2021-01-01,2026-06-22
+AGG,iShares Core U.S. Aggregate Bond ETF,Fixed Income,Failed,0,2021-01-01,2026-06-22
+LQD,iShares iBoxx Investment Grade Corporate Bond ETF,Fixed Income,Failed,0,2021-01-01,2026-06-22
+TLT,iShares 20+ Year Treasury Bond ETF,Fixed Income,Failed,0,2021-01-01,2026-06-22
+GLD,SPDR Gold Shares,Commodity,Failed,0,2021-01-01,2026-06-22
+USO,United States Oil Fund,Commodity,Failed,0,2021-01-01,2026-06-22
+EFA,iShares MSCI EAFE ETF,International,Failed,0,2021-01-01,2026-06-22
+EEM,iShares MSCI Emerging Markets ETF,International,Failed,0,2021-01-01,2026-06-22
+EWY,iShares MSCI South Korea ETF,International,Failed,0,2021-01-01,2026-06-22
+IBIT,iShares Bitcoin Trust,Alternatives,Failed,0,2021-01-01,2026-06-22

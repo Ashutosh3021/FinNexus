@@ -13,41 +13,42 @@ from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
-# Import libraries
+import subprocess
+import sys
+
+# Set up logging FIRST so that logger is available for imports
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Optional imports with graceful failure
+nselib = None
+capital_market = None
 try:
     import nselib
     from nselib import capital_market
 except ImportError:
-    print("Installing nselib...")
-    os.system('pip install nselib')
-    from nselib import capital_market
+    logger.warning("nselib not available, will use other sources")
 
+yf = None
 try:
     import yfinance as yf
 except ImportError:
-    print("Installing yfinance...")
-    os.system('pip install yfinance')
-    import yfinance as yf
+    logger.warning("yfinance not available, will use other sources")
 
+nsepy = None
+get_history = None
 try:
     from nsepy import get_history
-    from nsepy import get_index
 except ImportError:
-    print("Installing nsepy...")
-    os.system('pip install nsepy')
-    from nsepy import get_history
-    from nsepy import get_index
+    logger.warning("nsepy not available, will use other sources")
 
+pyzdata = None
+PyZData = None
+Interval = None
 try:
     from pyzdata import PyZData, Interval
 except ImportError:
-    print("Installing pyzdata...")
-    os.system('pip install pyzdata')
-    from pyzdata import PyZData, Interval
-
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+    logger.warning("pyzdata not available, will use other sources")
 
 class NSEIndexDataCollector:
     def __init__(self, start_date='2021-01-01', end_date='2026-06-22', output_dir='Stock'):
@@ -91,6 +92,8 @@ class NSEIndexDataCollector:
         Returns:
             List of symbols
         """
+        if capital_market is None:
+            return []
         try:
             if 'NIFTY 50' in index_name:
                 df = capital_market.nifty50_equity_list()
@@ -183,6 +186,8 @@ class NSEIndexDataCollector:
         Returns:
             DataFrame with OHLCV data
         """
+        if yf is None:
+            return pd.DataFrame()
         try:
             # Add .NS suffix for NSE stocks
             ticker = f"{symbol}.NS"
@@ -209,6 +214,8 @@ class NSEIndexDataCollector:
         Returns:
             DataFrame with OHLCV data
         """
+        if get_history is None:
+            return pd.DataFrame()
         try:
             df = get_history(symbol=symbol, 
                            start=start_date, 
@@ -236,6 +243,8 @@ class NSEIndexDataCollector:
         Returns:
             DataFrame with OHLCV data
         """
+        if capital_market is None:
+            return pd.DataFrame()
         try:
             df = capital_market.price_volume_data(
                 symbol=symbol,
@@ -275,12 +284,7 @@ class NSEIndexDataCollector:
         if not df1.empty:
             dataframes.append(df1)
         
-        # Try nsepy
-        df2 = self.fetch_data_nsepy(symbol, start_date, end_date)
-        if not df2.empty:
-            dataframes.append(df2)
-        
-        # Try yfinance
+        # Try yfinance (skip nsepy since it's broken)
         df3 = self.fetch_data_yfinance(symbol, start_date, end_date)
         if not df3.empty:
             dataframes.append(df3)

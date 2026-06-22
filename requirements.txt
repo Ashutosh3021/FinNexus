@@ -1,0 +1,36 @@
+# Core Libraries
+pandas>=2.0.0,<2.3.0
+numpy>=1.24.0,<2.3.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+
+# Stock (India) Libraries
+nselib==0.2.0
+nsepy==0.8
+yfinance>=0.2.28,<1.0.0
+pyzdata>=0.1.0
+
+# ETF (US) Libraries
+alpha-vantage==2.3.1
+pandas-datareader>=0.10.0
+
+# Futures & Options (India) Libraries
+jugaad-data>=0.3.0
+# nsefetch removed (not on PyPI)
+nsefin<=0.1.5   # latest available version
+
+# Commodities Libraries
+oilpriceapi>=1.0.0
+eodhd>=0.5.0
+eia-ng-client<=0.1.80   # latest available version
+beautifulsoup4>=4.12.0
+
+# Cryptocurrency Libraries
+# ml4t-data removed (not on PyPI)
+ccxt>=4.1.0
+
+# Additional Utilities
+lxml>=4.9.0
+openpyxl>=3.1.0
+xlrd>=2.0.0

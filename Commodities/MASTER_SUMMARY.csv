@@ -1,0 +1,15 @@
+category,commodity,codes,sources,status,rows,date_range_start,date_range_end
+Energy,Brent_Crude_Oil,"BRENT, BRENT_CRUDE_USD","oilpriceapi, eodhd",Failed,0,2021-01-01,2026-06-22
+Energy,WTI_Crude_Oil,"WTI, WTI_CRUDE_USD","oilpriceapi, eodhd",Success,1000,2021-01-01,2026-06-22
+Energy,Natural_Gas,"NATURAL_GAS, NATURAL_GAS_USD, NG","oilpriceapi, eodhd, eia",Failed,0,2021-01-01,2026-06-22
+Precious_Metals,Gold,"GOLD, XAU",eodhd,Failed,0,2021-01-01,2026-06-22
+Precious_Metals,Silver,"SILVER, XAG",eodhd,Failed,0,2021-01-01,2026-06-22
+Precious_Metals,Platinum,"PLATINUM, XPT",eodhd,Failed,0,2021-01-01,2026-06-22
+Base_Metals,Copper,COPPER,eodhd,Failed,0,2021-01-01,2026-06-22
+Base_Metals,Aluminum,ALUMINUM,eodhd,Failed,0,2021-01-01,2026-06-22
+Base_Metals,Lead,LEAD,eodhd,Failed,0,2021-01-01,2026-06-22
+Agriculture,Wheat,WHEAT,"eodhd, usda",Failed,0,2021-01-01,2026-06-22
+Agriculture,Corn,CORN,"eodhd, usda",Failed,0,2021-01-01,2026-06-22
+Agriculture,Cotton,COTTON,"eodhd, usda",Failed,0,2021-01-01,2026-06-22
+Agriculture,Natural_Rubber,RUBBER,eodhd,Failed,0,2021-01-01,2026-06-22
+Fertilizers,Fertilizer_Index,FERTILIZER,eodhd,Failed,0,2021-01-01,2026-06-22

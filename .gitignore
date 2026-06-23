@@ -6,3 +6,5 @@ src
 .venv/
 __pycache__/
 Reports/
+Train/
+Test/

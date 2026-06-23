@@ -4,3 +4,5 @@ desighn.md
 .planning
 src
 .venv/
+__pycache__/
+Reports/

@@ -537,7 +537,7 @@ graph LR
     end
 
     subgraph Portfolio
-        Portfolio[GET /portfolio]
+        PortfolioOverview[GET /portfolio]
         Add[POST /portfolio/add]
         Remove["DELETE /portfolio/{id}"]
         PnL[GET /portfolio/pnl]

@@ -533,13 +533,13 @@ graph LR
     subgraph Signals
         Daily[GET /signals/daily]
         History[GET /signals/history]
-        Asset[GET /signals/asset/{id}]
+        Asset[GET /signals/asset/\{id\}]
     end
 
     subgraph Portfolio
         Portfolio[GET /portfolio]
         Add[POST /portfolio/add]
-        Remove[DELETE /portfolio/{id}]
+        Remove[DELETE /portfolio/\{id\}]
         PnL[GET /portfolio/pnl]
     end
 

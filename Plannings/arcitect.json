@@ -1,0 +1,196 @@
+{
+  "timestamp": "2026-06-24T07:50:22.721Z",
+  "nodes": [
+    {
+      "id": 1782286927374.7937,
+      "type": "text",
+      "x": 257,
+      "y": 212,
+      "content": "The context Node in We have all the context in txt or Md format Which will be used To give to the llm To know the context From this the LLM Make its doubts and questions",
+      "hasFile": false
+    },
+    {
+      "id": 1782286989997.575,
+      "type": "text",
+      "x": 339,
+      "y": 381,
+      "content": "the bot who will ask questions (the babby)",
+      "hasFile": false
+    },
+    {
+      "id": 1782287058190.5396,
+      "type": "text",
+      "x": 445,
+      "y": 210,
+      "content": "The LLM node layer which will be used To generate the questions which we will ask To the user By the system prompt The questions Generated from the context we have already in the context mode which will be collected by the board and there would be a mutual connexion between the LLM the context and the bot",
+      "hasFile": false
+    },
+    {
+      "id": 1782287089389.5132,
+      "type": "text",
+      "x": 551.7654320987654,
+      "y": 442.45903479236813,
+      "content": "the ML model",
+      "hasFile": false
+    },
+    {
+      "id": 1782287130554.2566,
+      "type": "text",
+      "x": 716.7485970819304,
+      "y": 363.8956228956229,
+      "content": "the backend",
+      "hasFile": false
+    },
+    {
+      "id": 1782287148134.7659,
+      "type": "text",
+      "x": -2.253790656670148,
+      "y": 473.710257109673,
+      "content": "the user",
+      "hasFile": false
+    },
+    {
+      "id": 1782287158695.336,
+      "type": "text",
+      "x": 910,
+      "y": 381,
+      "content": "the user",
+      "hasFile": false
+    },
+    {
+      "id": 1782287194308.915,
+      "type": "text",
+      "x": 155.86572829567876,
+      "y": 554.5985697284093,
+      "content": "the rag model containg the news the bookish theorys",
+      "hasFile": false
+    },
+    {
+      "id": 1782287276799.0288,
+      "type": "text",
+      "x": 394.63860830527494,
+      "y": 571.5274971941639,
+      "content": "the new datas in the market",
+      "hasFile": false
+    },
+    {
+      "id": 1782287318781.8818,
+      "type": "text",
+      "x": 195.91151108709408,
+      "y": 879.2288053527193,
+      "content": "questions",
+      "hasFile": false
+    },
+    {
+      "id": 1782287361038.318,
+      "type": "text",
+      "x": -151.50086309085938,
+      "y": 403.465916220744,
+      "content": "answers recorded by user",
+      "hasFile": false
+    },
+    {
+      "id": 1782287369218.9363,
+      "type": "text",
+      "x": -291.2340848070029,
+      "y": 583.6240958040003,
+      "content": "papper cash",
+      "hasFile": false
+    },
+    {
+      "id": 1782287374232.2903,
+      "type": "text",
+      "x": -155.87323638010716,
+      "y": 727.6778427537242,
+      "content": "papper trading",
+      "hasFile": false
+    }
+  ],
+  "connections": [
+    {
+      "id": 1782287063985,
+      "startNodeId": 1782286927374.7937,
+      "endNodeId": 1782286989997.575
+    },
+    {
+      "id": 1782287065837,
+      "startNodeId": 1782287058190.5396,
+      "endNodeId": 1782286927374.7937
+    },
+    {
+      "id": 1782287070081,
+      "startNodeId": 1782287058190.5396,
+      "endNodeId": 1782286989997.575
+    },
+    {
+      "id": 1782287096736,
+      "startNodeId": 1782286989997.575,
+      "endNodeId": 1782287089389.5132
+    },
+    {
+      "id": 1782287138653,
+      "startNodeId": 1782287089389.5132,
+      "endNodeId": 1782287130554.2566
+    },
+    {
+      "id": 1782287164786,
+      "startNodeId": 1782287148134.7659,
+      "endNodeId": 1782286989997.575
+    },
+    {
+      "id": 1782287166613,
+      "startNodeId": 1782287158695.336,
+      "endNodeId": 1782287130554.2566
+    },
+    {
+      "id": 1782287199114,
+      "startNodeId": 1782287194308.915,
+      "endNodeId": 1782286989997.575
+    },
+    {
+      "id": 1782287282392,
+      "startNodeId": 1782286989997.575,
+      "endNodeId": 1782287276799.0288
+    },
+    {
+      "id": 1782287284198,
+      "startNodeId": 1782287276799.0288,
+      "endNodeId": 1782287089389.5132
+    },
+    {
+      "id": 1782287323523,
+      "startNodeId": 1782286989997.575,
+      "endNodeId": 1782287318781.8818
+    },
+    {
+      "id": 1782287342952,
+      "startNodeId": 1782287148134.7659,
+      "endNodeId": 1782287318781.8818
+    },
+    {
+      "id": 1782287388077,
+      "startNodeId": 1782287148134.7659,
+      "endNodeId": 1782287361038.318
+    },
+    {
+      "id": 1782287389819,
+      "startNodeId": 1782287361038.318,
+      "endNodeId": 1782286927374.7937
+    },
+    {
+      "id": 1782287408410,
+      "startNodeId": 1782287369218.9363,
+      "endNodeId": 1782287361038.318
+    },
+    {
+      "id": 1782287412226,
+      "startNodeId": 1782287374232.2903,
+      "endNodeId": 1782287369218.9363
+    }
+  ],
+  "viewport": {
+    "scale": 0.5870308950000004,
+    "offsetX": 343.9194054587609,
+    "offsetY": -13.491375303388224
+  }
+}

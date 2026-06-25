@@ -1,6 +1,6 @@
 ﻿"""
-FinNexus Bot — HITL Question Generator  (v2 — Decision Intelligence)
-=====================================================================
+FinNexus Bot — HITL Question Generator  (v3 — Batched RAG-Driven Generation)
+=============================================================================
 Generates 19 questions per session that extract HUMAN TRADING INTELLECT:
   - 10 Scenario MCQ  : "You hold X, news Y breaks. What do you DO?"
   - 5  Impact MCQ    : "News Z hits Asset A. What's your assessment?"
@@ -10,8 +10,20 @@ Generates 19 questions per session that extract HUMAN TRADING INTELLECT:
 
 NO trivia. NO definitions. Every question demands a decision under uncertainty.
 
+Generation is split into 4 focused LLM batches:
+  Batch A: 5 scenario_mcq  (primary asset from context)
+  Batch B: 5 impact_mcq    (news-driven impact assessment)
+  Batch C: 5 scenario_mcq  (different/secondary assets)
+  Batch D: 4 SAQ           (2 strategy_saq + 2 risk_saq)
+
+Each batch prompt is under 800 tokens. Each uses the slim context dict from
+context_injector.py. Failed batches retry once with a minimal fallback prompt.
+
+Provider support (via factory):
+  openai | groq | anthropic | gemini | mistral | cohere | ollama
+
 Question lifecycle:
-  MarketContext → LLMClient → QuestionGenerator → List[Question]
+  slim_context → BatchPromptBuilder → LLMClient → parser → List[Question]
   If LLM unavailable → _TEMPLATE_QUESTIONS (scenario bank) used as fallback.
 """
 
@@ -21,9 +33,10 @@ import json
 import logging
 import random
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from Bot.schemas import Question, QuestionType
 from Bot import config as cfg
@@ -100,41 +113,124 @@ class MarketContext:
 
 
 # ---------------------------------------------------------------------------
-# LLM Client (unchanged — OpenAI-compatible wrapper)
+# LLM Client — provider-agnostic factory
+# ---------------------------------------------------------------------------
+# Supported providers:
+#   openai    — via openai SDK (default)
+#   groq      — via openai SDK + Groq base URL
+#   ollama    — via openai SDK + local base URL
+#   anthropic — via anthropic SDK
+#   gemini    — via openai SDK + Google AI base URL (openai-compat endpoint)
+#   mistral   — via openai SDK + Mistral base URL
+#   cohere    — via cohere SDK
 # ---------------------------------------------------------------------------
 
-class LLMClient:
-    """Thin wrapper supporting OpenAI, Groq, and Ollama."""
+# Provider → (base_url, uses_openai_sdk)
+_PROVIDER_CONFIG: Dict[str, Tuple[str, bool]] = {
+    "openai":    ("",                                         True),
+    "groq":      ("https://api.groq.com/openai/v1",          True),
+    "ollama":    ("http://localhost:11434/v1",                True),
+    "gemini":    ("https://generativelanguage.googleapis.com/v1beta/openai", True),
+    "mistral":   ("https://api.mistral.ai/v1",               True),
+    "cohere":    ("",                                         False),   # native SDK
+    "anthropic": ("",                                         False),   # native SDK
+}
 
-    def __init__(self, provider="openai", api_key="", model="gpt-4o-mini", base_url=""):
-        self.provider  = provider
-        self.api_key   = api_key
-        self.model     = model
-        self.base_url  = base_url
-        self._client   = None
+
+class LLMClient:
+    """
+    Provider-agnostic LLM wrapper.
+
+    Build with get_llm_client() or directly:
+        client = LLMClient(provider="groq", api_key="...", model="gemma2-9b-it")
+        client = LLMClient(provider="anthropic", api_key="...", model="claude-3-haiku-20240307")
+    """
+
+    def __init__(
+        self,
+        provider: str = "openai",
+        api_key: str = "",
+        model: str = "gpt-4o-mini",
+        base_url: str = "",
+    ):
+        self.provider = provider.lower().strip()
+        self.api_key  = api_key
+        self.model    = model
+        self.base_url = base_url
+        self._client: Optional[Any] = None
         self._init_client()
 
-    def _init_client(self):
-        if not self.api_key and self.provider != "ollama":
-            logger.warning("LLMClient: no API key — will use template fallback")
+    # ── Init ─────────────────────────────────────────────────────────────────
+
+    def _init_client(self) -> None:
+        if not self.api_key and self.provider not in ("ollama",):
+            logger.warning("LLMClient: no API key for provider '%s' — will use template fallback",
+                           self.provider)
             return
+
+        cfg_entry = _PROVIDER_CONFIG.get(self.provider)
+        if cfg_entry is None:
+            logger.warning("LLMClient: unknown provider '%s'", self.provider)
+            return
+
+        default_base_url, uses_openai_sdk = cfg_entry
+
+        if uses_openai_sdk:
+            self._init_openai_compat(default_base_url)
+        elif self.provider == "anthropic":
+            self._init_anthropic()
+        elif self.provider == "cohere":
+            self._init_cohere()
+
+    def _init_openai_compat(self, default_base_url: str) -> None:
         try:
-            from openai import OpenAI
+            from openai import OpenAI  # type: ignore
             kwargs: Dict[str, Any] = {"api_key": self.api_key or "ollama"}
-            if self.base_url:
-                kwargs["base_url"] = self.base_url
-            elif self.provider == "groq":
-                kwargs["base_url"] = "https://api.groq.com/openai/v1"
-            elif self.provider == "ollama":
-                kwargs["base_url"] = self.base_url or "http://localhost:11434/v1"
+            # Explicit base_url overrides provider default
+            effective_url = self.base_url or default_base_url
+            if effective_url:
+                kwargs["base_url"] = effective_url
             self._client = OpenAI(**kwargs)
-            logger.info("LLMClient: %s / %s ready", self.provider, self.model)
+            logger.info("LLMClient: %s / %s ready (openai-compat)", self.provider, self.model)
         except ImportError:
             logger.warning("LLMClient: openai package not installed")
 
-    def complete(self, prompt: str, temperature: float = 0.85, max_tokens: int = 4000) -> str:
+    def _init_anthropic(self) -> None:
+        try:
+            import anthropic  # type: ignore
+            self._client = anthropic.Anthropic(api_key=self.api_key)
+            logger.info("LLMClient: anthropic / %s ready", self.model)
+        except ImportError:
+            logger.warning("LLMClient: anthropic package not installed — pip install anthropic")
+
+    def _init_cohere(self) -> None:
+        try:
+            import cohere  # type: ignore
+            self._client = cohere.Client(api_key=self.api_key)
+            logger.info("LLMClient: cohere / %s ready", self.model)
+        except ImportError:
+            logger.warning("LLMClient: cohere package not installed — pip install cohere")
+
+    # ── Complete ─────────────────────────────────────────────────────────────
+
+    def complete(
+        self,
+        prompt: str,
+        temperature: float = 0.85,
+        max_tokens: int = 1200,
+    ) -> str:
+        """Send a prompt, return the response text. Raises on failure."""
         if self._client is None:
-            raise RuntimeError("LLM client not initialised")
+            raise RuntimeError(f"LLMClient ({self.provider}): client not initialised")
+
+        if self.provider == "anthropic":
+            return self._complete_anthropic(prompt, temperature, max_tokens)
+        if self.provider == "cohere":
+            return self._complete_cohere(prompt, temperature, max_tokens)
+        # All openai-compat providers
+        return self._complete_openai(prompt, temperature, max_tokens)
+
+    def _complete_openai(self, prompt: str, temperature: float, max_tokens: int) -> str:
         resp = self._client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
@@ -143,122 +239,217 @@ class LLMClient:
         )
         return resp.choices[0].message.content or ""
 
+    def _complete_anthropic(self, prompt: str, temperature: float, max_tokens: int) -> str:
+        resp = self._client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        # Response is a list of content blocks
+        return "".join(
+            block.text for block in resp.content
+            if hasattr(block, "text")
+        )
+
+    def _complete_cohere(self, prompt: str, temperature: float, max_tokens: int) -> str:
+        resp = self._client.chat(
+            model=self.model,
+            message=prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return resp.text or ""
+
     @property
     def available(self) -> bool:
         return self._client is not None
 
 
 # ---------------------------------------------------------------------------
-# System prompt for the LLM
+# Factory function
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """You are FINNEXUS HITL Question Generator.
-Your purpose is to extract HUMAN TRADING INTELLECT through scenario-based questions.
+def get_llm_client(
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> LLMClient:
+    """
+    Factory: build an LLMClient from args or fall back to config/env values.
 
-CORE RULES — NEVER VIOLATE:
-1. NEVER ask definition or trivia questions ("What does RSI stand for?" is FORBIDDEN).
-2. EVERY question must present a real decision under uncertainty.
-3. MCQ options must represent different trading philosophies — there is NO single correct answer.
-4. SAQs must require synthesis of multiple factors (news + price action + risk).
-5. Questions must feel like they could happen TODAY in a live trading session.
-6. Use the MARKET CONTEXT provided — reference actual prices, news, and trends.
-7. Separate aggressive/momentum traders from conservative/risk-first traders through option design.
-
-OPTION DESIGN GUIDE for MCQ:
-  Option A — Aggressive momentum (ride the move)
-  Option B — Conservative scale-out (take partial profits / cut partial loss)
-  Option C — Hedging / risk management (protect the position)
-  Option D — Wait and observe (more data needed)
-  Option E — Contrarian / macro override
-
-SCORING PHILOSOPHY: Answers are not right/wrong. They reveal trading psychology.
-The question should expose: risk tolerance, conviction level, time horizon, macro awareness.
-
-OUTPUT FORMAT — return ONLY a valid JSON array, zero other text:
-[
-  {
-    "type": "scenario_mcq",
-    "scenario": "📊 You hold [position]. 📰 NEWS: [specific event]. [Price action context].",
-    "options": ["🟢 Option A", "🟡 Option B", "🔵 Option C", "🟣 Option D", "🔴 Option E"],
-    "context": "Reveals: [what each choice says about the trader]",
-    "asset_class": "Stocks|Crypto|ETFs|Futures|Commodities",
-    "asset_symbol": "SYMBOL",
-    "reveals": "risk_tolerance|conviction|macro_awareness|discipline|time_horizon"
-  },
-  {
-    "type": "impact_mcq",
-    "scenario": "📰 NEWS: [specific event]. 🏭 ASSET: [asset + current price]. Key levels: [support/resistance].",
-    "options": [
-      "🟢 Strongly bullish — [specific target]",
-      "🟡 Mildly bullish — [specific target]",
-      "⚪ Neutral — already priced in",
-      "🟠 Mildly bearish — [specific target]",
-      "🔴 Strongly bearish — [specific target]"
-    ],
-    "context": "Reveals: [what choice says about trader's macro model]",
-    "asset_class": "...",
-    "asset_symbol": "..."
-  },
-  {
-    "type": "strategy_saq",
-    "question": "📊 [Market state with specific numbers]. 📰 NEWS: [events]. You have [capital] to deploy over [timeframe]. Outline your specific trading plan: asset selection, position sizing, entry/exit levels, and reasoning.",
-    "context": "Portfolio context: [relevant background]",
-    "word_limit": 80
-  },
-  {
-    "type": "risk_saq",
-    "question": "⚠️ RISK SIGNAL: [specific scenario]. Your current portfolio: [allocation]. How do you reposition and what is your risk framework?",
-    "context": "Key risk factors: [list]",
-    "word_limit": 80
-  }
-]"""
-
-
-# ---------------------------------------------------------------------------
-# Prompt builder
-# ---------------------------------------------------------------------------
-
-def _build_generation_prompt(level: int, context: MarketContext) -> str:
-    level_profiles = {
-        1: "Level 1 (Beginner): Use simple scenarios — single asset, one news event. "
-           "Prices and positions should be small. Test basic risk instincts.",
-        2: "Level 2 (Intermediate): Multi-factor scenarios. Include sector context. "
-           "Test MACD/BB decision points embedded in real situations.",
-        3: "Level 3 (Advanced): Options, futures, cross-asset. Include Greeks context in scenarios. "
-           "Test hedging decisions and volatility regime awareness.",
-        4: "Level 4 (Expert): Portfolio-level decisions. Stat arb, basis trades, factor exposures. "
-           "Test risk-adjusted thinking and multi-leg strategy reasoning.",
-        5: "Level 5 (Master): Macro regime, systemic risk, ML signal interpretation. "
-           "Test synthesis of global macro + quantitative signal + portfolio risk.",
-        20: "Level 20 (Global Events): Major macro shocks only — Fed decisions, geopolitical crises, "
-            "currency contagion, commodity supply shocks. Test cross-asset contagion reasoning.",
-    }
-    profile = level_profiles.get(level, level_profiles[2])
-
-    counts = (
-        f"Generate EXACTLY: {_N_SCENARIO_MCQ} scenario_mcq, "
-        f"{_N_IMPACT_MCQ} impact_mcq, "
-        f"{_N_STRATEGY_SAQ} strategy_saq, "
-        f"{_N_RISK_SAQ} risk_saq"
+    Usage:
+        client = get_llm_client()                          # reads from config
+        client = get_llm_client(provider="groq", ...)      # explicit
+    """
+    return LLMClient(
+        provider=provider or cfg.LLM_PROVIDER,
+        api_key=api_key   or cfg.LLM_API_KEY,
+        model=model       or cfg.LLM_MODEL,
+        base_url=base_url or cfg.LLM_BASE_URL,
     )
-    if level == 20:
-        counts = (
-            "Generate EXACTLY: 8 scenario_mcq, 5 impact_mcq, 2 strategy_saq, "
-            "2 risk_saq, 1 strategy_saq (global macro synthesis spanning 5+ assets and 3+ news events)"
+
+
+# ---------------------------------------------------------------------------
+# Batch prompt builder
+# ---------------------------------------------------------------------------
+
+# Level-specific complexity descriptors (used in all batch prompts)
+_LEVEL_DESCRIPTORS: Dict[int, str] = {
+    1:  "beginner — single asset, one news event, basic risk instincts",
+    2:  "intermediate — multi-factor, sector context, MACD/BB scenarios",
+    3:  "advanced — options Greeks, cross-asset, vol regime awareness",
+    4:  "expert — stat arb, factor models, portfolio risk, basis trades",
+    5:  "master — macro regime, systemic risk, ML signal synthesis",
+    20: "global events — Fed decisions, geopolitical crises, cross-asset contagion",
+}
+
+# Secondary asset pools per level for Batch C (different assets than primary)
+_SECONDARY_ASSETS: Dict[int, List[str]] = {
+    1:  ["NIFTY", "GOLD", "SPY", "ETH", "WHEAT"],
+    2:  ["BANKNIFTY", "BNB", "SILVER", "QQQ", "BRENT"],
+    3:  ["USDJPY", "COPPER", "TLT", "SOL", "NATGAS"],
+    4:  ["TLT", "COPPER", "USDINR", "LQD", "XLE"],
+    5:  ["DXY", "VIX", "GOLD", "NIFTY", "BRENT"],
+    20: ["DXY", "GOLD", "TLT", "USDJPY", "BRENT"],
+}
+
+
+def _slim_context_to_vars(slim: Dict) -> Dict[str, str]:
+    """
+    Extract flat string variables from slim context dict for prompt interpolation.
+    Never raises — returns safe defaults on any missing field.
+    """
+    mkt      = slim.get("market", {})
+    news     = slim.get("news", [])
+    user     = slim.get("user", {})
+
+    asset    = mkt.get("asset", "SPY")
+    price    = mkt.get("price", 0.0)
+    regime   = mkt.get("regime", "neutral")
+    trend    = mkt.get("trend", "flat")
+    vix      = mkt.get("vix", 18.0)
+    level    = user.get("level", 1)
+    weakness = user.get("weakness", "risk management")
+
+    top_news = news[0].get("headline", "No major news") if news else "No major news"
+    news2    = news[1].get("headline", "") if len(news) > 1 else ""
+    affected = (news[0].get("affected", []) or []) if news else []
+    top_affected = affected[0] if affected else asset
+
+    price_str = f"${price:,.2f}" if price > 0 else "unknown price"
+
+    return {
+        "asset":        asset,
+        "price":        price_str,
+        "regime":       regime,
+        "trend":        trend,
+        "vix":          f"{vix:.1f}",
+        "level":        str(level),
+        "weakness":     weakness,
+        "top_headline": top_news,
+        "headline2":    news2,
+        "top_affected": top_affected,
+    }
+
+
+def _build_batch_prompt(
+    batch: str,          # "A" | "B" | "C" | "D"
+    level: int,
+    slim: Dict,
+    secondary_asset: str = "",
+) -> str:
+    """
+    Build a focused batch prompt under ~800 tokens.
+
+    Batch A: 5 scenario_mcq  — primary asset
+    Batch B: 5 impact_mcq    — news-driven
+    Batch C: 5 scenario_mcq  — secondary asset (different from A)
+    Batch D: 4 SAQ            — 2 strategy_saq + 2 risk_saq
+    """
+    v = _slim_context_to_vars(slim)
+    level_desc = _LEVEL_DESCRIPTORS.get(level, _LEVEL_DESCRIPTORS[2])
+
+    base = (
+        f"You generate trading scenario questions. Be concise.\n"
+        f"Context: {v['asset']} at {v['price']}, market: {v['regime']} (VIX {v['vix']}), "
+        f"trend: {v['trend']}\n"
+        f"News: {v['top_headline']}\n"
+        f"User level: {v['level']} ({level_desc}), target weakness: {v['weakness']}\n"
+    )
+
+    if batch == "A":
+        return base + (
+            f"Generate 5 scenario_mcq questions about {v['asset']}.\n"
+            "Each must: reference the real asset and price above, describe a realistic "
+            "decision scenario the user is ALREADY IN (holding a position), "
+            "have 5 options from aggressive to conservative.\n"
+            'Return JSON array only. No explanation. No markdown.\n'
+            'Schema: [{"type":"scenario_mcq","scenario":"...","options":["🟢...","🟡...","🔵...","🟣...","🔴..."],'
+            '"asset_class":"Stocks|Crypto|ETFs|Futures|Commodities","asset_symbol":"SYMBOL",'
+            '"context":"Reveals: ...","reveals":"dimension"}]'
         )
 
-    return f"""{_SYSTEM_PROMPT}
+    if batch == "B":
+        news_line = f"{v['top_headline']}"
+        if v["headline2"]:
+            news_line += f" | {v['headline2']}"
+        return base + (
+            f"Generate 5 impact_mcq questions. Each presents a news event and asks "
+            f"the trader to assess its impact on {v['top_affected']} or related assets.\n"
+            "Each must: state the news clearly, name the asset and its current price, "
+            "have 5 options from strongly bullish to strongly bearish.\n"
+            'Return JSON array only. No explanation. No markdown.\n'
+            'Schema: [{"type":"impact_mcq","scenario":"📰 NEWS: ... 🏭 ASSET: ... Key levels: ...",'
+            '"options":["🟢 Strongly bullish — target","🟡 Mildly bullish — target",'
+            '"⚪ Neutral — priced in","🟠 Mildly bearish — target","🔴 Strongly bearish — target"],'
+            '"asset_class":"...","asset_symbol":"...","context":"Reveals: ..."}]'
+        )
 
---- MARKET CONTEXT ---
-{context.to_prompt_block()}
+    if batch == "C":
+        sec = secondary_asset or v["top_affected"]
+        return base + (
+            f"Generate 5 scenario_mcq questions about {sec} (a DIFFERENT asset than {v['asset']}).\n"
+            "Each must: reference a realistic position the user holds in this asset, "
+            "connect to the news context, "
+            "have 5 options from aggressive to conservative.\n"
+            'Return JSON array only. No explanation. No markdown.\n'
+            'Schema: [{"type":"scenario_mcq","scenario":"...","options":["🟢...","🟡...","🔵...","🟣...","🔴..."],'
+            '"asset_class":"Stocks|Crypto|ETFs|Futures|Commodities","asset_symbol":"SYMBOL",'
+            '"context":"Reveals: ...","reveals":"dimension"}]'
+        )
 
---- TASK ---
-{profile}
+    # Batch D: SAQ
+    return base + (
+        f"Generate 2 strategy_saq and 2 risk_saq questions.\n"
+        "strategy_saq: trader has capital to deploy, must outline plan with entry/exit/sizing.\n"
+        "risk_saq: trader faces a risk signal, must explain repositioning and risk framework.\n"
+        f"Reference {v['asset']} at {v['price']} and the news above.\n"
+        'Return JSON array only. No explanation. No markdown.\n'
+        'Schema: [{"type":"strategy_saq","question":"📊 ...","context":"...","word_limit":80},'
+        '{"type":"risk_saq","question":"⚠️ RISK SIGNAL: ...","context":"...","word_limit":80}]'
+    )
 
-{counts} = 19 total questions.
-Use the market context above. Reference real prices, real news, real trends.
-Do NOT invent contradictory prices. Keep asset_symbol realistic.
-Return ONLY the JSON array."""
+
+def _build_fallback_prompt(batch: str, level: int, slim: Dict) -> str:
+    """
+    Minimal 3-sentence retry prompt used when the primary batch fails.
+    Keeps well under 200 tokens.
+    """
+    v = _slim_context_to_vars(slim)
+    type_map = {
+        "A": ("5", "scenario_mcq", v["asset"]),
+        "B": ("5", "impact_mcq",   v["top_affected"]),
+        "C": ("5", "scenario_mcq", v["top_affected"]),
+        "D": ("4", "strategy_saq and risk_saq", v["asset"]),
+    }
+    count, qtype, asset = type_map.get(batch, ("5", "scenario_mcq", v["asset"]))
+    return (
+        f"Generate {count} {qtype} trading questions about {asset} at {v['price']}. "
+        f"News: {v['top_headline']}. "
+        "Return a JSON array only, no other text."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -316,12 +507,17 @@ def _parse_llm_questions(raw: str, level: int) -> List[Question]:
 
 class QuestionGenerator:
     """
-    Generates 19 decision-intelligence questions per session.
+    Generates 19 decision-intelligence questions per session using 4 LLM batches.
 
-    Strategy:
-      1. LLM generates context-aware, news-driven scenarios if available.
-      2. Template bank fills remaining slots (also scenario-based — no trivia).
-      3. Questions are shuffled and re-indexed for the session.
+    Batch strategy:
+      A: 5 scenario_mcq  — primary asset from slim context
+      B: 5 impact_mcq    — news-driven impact assessment
+      C: 5 scenario_mcq  — secondary asset pool for variety
+      D: 4 SAQ            — 2 strategy_saq + 2 risk_saq
+
+    Each batch is a separate LLM call with its own prompt under ~800 tokens.
+    Failed batches retry once with a 3-sentence minimal prompt.
+    Templates fill any remaining slots.
     """
 
     def __init__(self, llm_client: Optional[LLMClient] = None):
@@ -339,30 +535,28 @@ class QuestionGenerator:
         if context is None:
             context = MarketContext(user_level=level)
 
+        # Build slim context dict for batch prompts
+        # Try to get it from context_injector; fall back to deriving from MarketContext
+        slim = _market_context_to_slim(context)
+
         questions: List[Question] = []
 
-        # ── LLM attempt ─────────────────────────────────────────────────────
+        # ── LLM batch generation ─────────────────────────────────────────────
         if self.llm and self.llm.available:
-            try:
-                prompt  = _build_generation_prompt(level, context)
-                raw     = self.llm.complete(prompt, temperature=0.85, max_tokens=4000)
-                llm_qs  = _parse_llm_questions(raw, level)
-                questions.extend(llm_qs)
-                logger.info(
-                    "QuestionGenerator: LLM produced %d questions for level %d",
-                    len(llm_qs), level,
-                )
-            except Exception as exc:
-                logger.warning("QuestionGenerator: LLM failed: %s — falling back to templates", exc)
+            questions = self._run_batches(level, slim)
 
-        # ── Template fill ────────────────────────────────────────────────────
+        # ── Template fill ─────────────────────────────────────────────────────
         needed = cfg.QUESTIONS_PER_LEVEL - len(questions)
         if needed > 0:
             used_ids = {q.id for q in questions}
             templates = _get_templates(level, needed, exclude_ids=used_ids)
             questions.extend(templates)
+            logger.info(
+                "QuestionGenerator: filled %d slots from templates for level %d",
+                needed, level,
+            )
 
-        # ── Finalise ─────────────────────────────────────────────────────────
+        # ── Finalise ──────────────────────────────────────────────────────────
         questions = questions[:cfg.QUESTIONS_PER_LEVEL]
         random.shuffle(questions)
 
@@ -376,9 +570,131 @@ class QuestionGenerator:
         )
         return questions
 
+    # ── Batch runner ──────────────────────────────────────────────────────────
+
+    def _run_batches(self, level: int, slim: Dict) -> List[Question]:
+        """
+        Execute all 4 batches, collect parsed questions.
+        Each batch gets 1 retry on failure.
+        """
+        # Pick a secondary asset that differs from the primary
+        primary_asset = slim.get("market", {}).get("asset", "")
+        secondary_pool = [
+            a for a in _SECONDARY_ASSETS.get(level, _SECONDARY_ASSETS[2])
+            if a != primary_asset
+        ]
+        secondary_asset = secondary_pool[0] if secondary_pool else "NIFTY"
+
+        batch_specs = [
+            ("A", 5),   # 5 scenario_mcq
+            ("B", 5),   # 5 impact_mcq
+            ("C", 5),   # 5 scenario_mcq (secondary asset)
+            ("D", 4),   # 2 strategy_saq + 2 risk_saq
+        ]
+
+        all_questions: List[Question] = []
+        for batch_id, target_count in batch_specs:
+            questions = self._run_single_batch(
+                batch_id=batch_id,
+                level=level,
+                slim=slim,
+                secondary_asset=secondary_asset,
+                target_count=target_count,
+            )
+            all_questions.extend(questions)
+
+        logger.info(
+            "QuestionGenerator: batches produced %d questions for level %d",
+            len(all_questions), level,
+        )
+        return all_questions
+
+    def _run_single_batch(
+        self,
+        batch_id: str,
+        level: int,
+        slim: Dict,
+        secondary_asset: str,
+        target_count: int,
+    ) -> List[Question]:
+        """Run one batch with one retry on failure."""
+        # Primary attempt
+        try:
+            prompt = _build_batch_prompt(batch_id, level, slim, secondary_asset)
+            raw = self.llm.complete(prompt, temperature=0.85, max_tokens=1200)
+            questions = _parse_llm_questions(raw, level)
+            if questions:
+                logger.debug(
+                    "QuestionGenerator: batch %s → %d questions", batch_id, len(questions)
+                )
+                return questions
+            logger.warning("QuestionGenerator: batch %s returned no parseable questions", batch_id)
+        except Exception as exc:
+            logger.warning("QuestionGenerator: batch %s failed: %s", batch_id, exc)
+
+        # Retry once with simplified fallback prompt
+        logger.info("QuestionGenerator: retrying batch %s with fallback prompt", batch_id)
+        try:
+            time.sleep(0.5)  # brief back-off before retry
+            fallback = _build_fallback_prompt(batch_id, level, slim)
+            raw = self.llm.complete(fallback, temperature=0.7, max_tokens=800)
+            questions = _parse_llm_questions(raw, level)
+            if questions:
+                logger.info("QuestionGenerator: batch %s retry succeeded → %d questions",
+                            batch_id, len(questions))
+                return questions
+        except Exception as exc:
+            logger.warning("QuestionGenerator: batch %s retry also failed: %s", batch_id, exc)
+
+        return []
+
     def _from_templates(self, level: int, count: int, exclude_ids: set) -> List[Question]:
         """Legacy internal helper — kept for any external callers."""
         return _get_templates(level, count, exclude_ids)
+
+
+# ---------------------------------------------------------------------------
+# MarketContext → slim dict adapter
+# (used when a MarketContext is passed in instead of a slim dict)
+# ---------------------------------------------------------------------------
+
+def _market_context_to_slim(ctx: MarketContext) -> Dict:
+    """
+    Convert a MarketContext into the slim dict format that batch prompts expect.
+    This is the bridge between the old MarketContext API and the new slim format.
+    """
+    # Build news items from headline strings
+    news_items: List[Dict] = []
+    for h in ctx.news[:3]:
+        # Strip the [IMPACT] prefix added by context_injector
+        headline = re.sub(r"^\[[\w_]+\]\s*", "", h)
+        news_items.append({"headline": headline, "impact": "neutral", "affected": []})
+
+    # Primary asset: use first price entry or fall back to "SPY"
+    if ctx.prices:
+        asset = next(iter(ctx.prices))
+        price = ctx.prices[asset]
+    else:
+        asset, price = "SPY", 0.0
+
+    trend = ctx.trends.get(asset, "flat") if ctx.trends else "flat"
+
+    return {
+        "market": {
+            "regime": ctx.regime,
+            "asset":  asset,
+            "price":  float(price),
+            "trend":  trend,
+            "vix":    float(ctx.vix_level),
+        },
+        "news":   news_items,
+        "theory": [],
+        "user":   {
+            "level":    ctx.user_level,
+            "weakness": ctx.user_history_summary.replace("Top weakness: ", "")
+                        if ctx.user_history_summary else "risk management",
+        },
+    }
 
 
 def _get_templates(level: int, count: int, exclude_ids: set) -> List[Question]:

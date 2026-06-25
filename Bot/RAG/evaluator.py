@@ -1,22 +1,14 @@
 """
-FinNexus Bot — Decision-Intelligence SAQ Evaluator  (v2)
-=========================================================
-Evaluates SHORT-ANSWER and MCQ responses for TRADING QUALITY, not factual correctness.
+FinNexus Bot — SAQ Evaluator
+=============================
+Scores SHORT-ANSWER and MCQ responses for TRADING DECISION QUALITY.
 
 Scoring philosophy:
-  - MCQ answers are not right/wrong; they reveal trading style.
-    Score measures: risk-awareness, reasoning quality, internal consistency.
-  - SAQ answers are scored on: Decision clarity, Risk awareness, Synthesis depth.
+  MCQ answers reveal trading style — not right/wrong.
+  SAQ answers scored on: Decision clarity, Risk awareness, Synthesis depth.
 
-LLM scoring evaluates:
-  1. Decision Quality (0-1): Is the answer actionable and well-reasoned?
-  2. Risk Awareness  (0-1): Does the trader acknowledge downside / position size / stops?
-  3. Synthesis       (0-1): Does the answer integrate multiple factors (price + news + macro)?
-
-Heuristic fallback evaluates:
-  - Presence of trading-specific keywords (stop, risk, hedge, sector, level, target...)
-  - Answer length and specificity
-  - Absence of vague/non-committal language
+Uses retrieved context from RAGRetriever (trading_theories + news_events).
+Does NOT handle context assembly — that belongs to context_injector.py.
 """
 
 from __future__ import annotations
@@ -69,14 +61,9 @@ class SAQEvaluator:
     """
     Evaluates SAQ and MCQ responses for trading decision quality.
 
-    For SAQ:
-      → LLM evaluates Decision Quality, Risk Awareness, Synthesis depth
-      → Heuristic fallback uses trading keyword density + specificity signals
-
-    For MCQ (scenario/impact — no correct answer):
-      → Always use heuristic: score the RESPONSE QUALITY of an optional
-        justification field, or assign a base score that reflects engagement.
-        (Pure MCQ selection is always scored 0.7 base — all choices are valid.)
+    Context is retrieved from RAGRetriever (top_k=3 max).
+    LLM fallback evaluates Decision Quality, Risk Awareness, Synthesis.
+    Heuristic fallback uses keyword density + specificity signals.
     """
 
     def __init__(self, retriever: "RAGRetriever", llm_client=None):
@@ -104,13 +91,13 @@ class SAQEvaluator:
             "method": "llm" | "heuristic"
           }
         """
-        # MCQ answer with no justification — base engagement score
+        # MCQ with no justification → base engagement score
         if question_subtype in ("scenario_mcq", "impact_mcq") and len(answer.strip().split()) < 5:
             return _mcq_selection_score(answer)
 
-        # Retrieve market context
+        # Retrieve scored context (top_k capped at 3 in retriever)
         query = f"{question} {context_hint}".strip()
-        context_text = self.retriever.get_context_text(query, top_k=4)
+        context_text = self.retriever.get_context_text(query, top_k=3)
 
         if self.llm is not None:
             try:
@@ -124,7 +111,7 @@ class SAQEvaluator:
 
     def _llm_evaluate(self, question: str, answer: str, context: str, word_limit: int) -> Dict:
         prompt = _build_eval_prompt(question, answer, context, word_limit)
-        raw    = self.llm.complete(prompt)
+        raw = self.llm.complete(prompt)
         return _parse_llm_response(raw)
 
     # ── Heuristic evaluation ──────────────────────────────────────────────────
@@ -135,26 +122,23 @@ class SAQEvaluator:
         word_count    = len(answer_words)
         answer_tokens = set(re.findall(r"\b\w{3,}\b", answer_lower))
 
-        # ── Decision quality ─────────────────────────────────────────────────
+        # Decision quality
         decision_hits = len(answer_tokens & _DECISION_WORDS)
-        # Penalise vague language
         vague_count   = sum(1 for p in _VAGUE_PHRASES if p in answer_lower)
         decision_raw  = min(decision_hits / 3.0, 1.0) - (vague_count * 0.15)
         decision_quality = float(max(decision_raw, 0.0))
 
-        # ── Risk awareness ───────────────────────────────────────────────────
+        # Risk awareness
         risk_hits     = len(answer_tokens & _RISK_WORDS)
-        # Bonus: numeric presence (stop at X, 20%, ₹50,000) signals specificity
         numeric_count = len(re.findall(r"\d+", answer))
         risk_raw      = min(risk_hits / 3.0, 1.0) + (min(numeric_count, 3) * 0.08)
         risk_awareness = float(min(risk_raw, 1.0))
 
-        # ── Synthesis depth ──────────────────────────────────────────────────
-        synth_hits    = len(answer_tokens & _SYNTHESIS_WORDS)
-        # Length bonus: longer, specific answers demonstrate synthesis
-        length_ratio  = min(word_count / max(word_limit * 0.5, 20), 1.0)
-        synth_raw     = (min(synth_hits / 4.0, 1.0) * 0.6) + (length_ratio * 0.4)
-        synthesis     = float(synth_raw)
+        # Synthesis depth
+        synth_hits  = len(answer_tokens & _SYNTHESIS_WORDS)
+        length_ratio = min(word_count / max(word_limit * 0.5, 20), 1.0)
+        synth_raw   = (min(synth_hits / 4.0, 1.0) * 0.6) + (length_ratio * 0.4)
+        synthesis   = float(synth_raw)
 
         score = round(decision_quality * 0.4 + risk_awareness * 0.35 + synthesis * 0.25, 4)
         feedback = _build_heuristic_feedback(score, decision_quality, risk_awareness, synthesis, word_count)
@@ -170,15 +154,11 @@ class SAQEvaluator:
 
 
 # ---------------------------------------------------------------------------
-# MCQ selection scorer (for scenario/impact MCQs — all options are valid)
+# MCQ selection scorer
 # ---------------------------------------------------------------------------
 
 def _mcq_selection_score(answer: str) -> Dict:
-    """
-    When a user picks an option letter/text without a justification,
-    award a base score of 0.7 — they engaged, all choices are legitimate.
-    If they also write a justification sentence, the full SAQ path is used.
-    """
+    """Base score for MCQ option selection without justification."""
     return {
         "score"           : 0.7,
         "feedback"        : (
@@ -257,8 +237,8 @@ def _parse_llm_response(raw: str) -> Dict:
         nums = re.findall(r"0\.\d+|1\.0", raw)
         fallback = float(nums[0]) if nums else 0.5
         return {
-            "score": round(fallback, 4),
-            "feedback": feedback or "Answer evaluated.",
+            "score"           : round(fallback, 4),
+            "feedback"        : feedback or "Answer evaluated.",
             "decision_quality": fallback,
             "risk_awareness"  : fallback,
             "synthesis"       : fallback,

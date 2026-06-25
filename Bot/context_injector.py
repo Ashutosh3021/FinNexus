@@ -1,21 +1,23 @@
 """
-FinNexus Bot — Market Context Fetcher
-======================================
-Pulls real-time market data and news to populate MarketContext before
-question generation. Falls back gracefully when APIs are unavailable.
+FinNexus Bot — Context Injector
+=================================
+Assembles a slim, LLM-ready context dict from RAG retrievals.
 
-Supported data sources (in priority order):
-  1. yfinance  — price snapshots (free, no key)
-  2. NewsAPI   — recent headlines (free tier, key required)
-  3. Hardcoded fallbacks — always available
+The injector pulls from three RAG collections (market_data, news_events,
+trading_theories) and merges live market signals + user profile into one
+tight dict that fits under 500 tokens when serialized.
 
-Typical usage:
-    from context_fetcher import build_context
-    from llm_generator import QuestionGenerator, MarketContext
+OUTPUT FORMAT (strict):
+{
+  "market": { "regime": str, "asset": str, "price": float, "trend": str, "vix": float },
+  "news":   [ { "headline": str, "impact": str, "affected": list } ],  // max 3 items
+  "theory": [ { "name": str, "key_point": str } ],                     // max 3 items
+  "user":   { "level": int, "weakness": str }                          // single top weakness
+}
 
-    ctx = build_context(user_level=2, user_id=42)
-    gen = QuestionGenerator(llm_client=my_llm)
-    questions = gen.generate(level=2, user_id=42, context=ctx)
+Also exposes:
+  - ContextInjector class (used by Bot/main.py: self._context_injector.build_context(user_id, level))
+  - build_context() module-level function (backwards-compat for direct callers)
 """
 
 from __future__ import annotations
@@ -24,245 +26,381 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Cache
 # ---------------------------------------------------------------------------
 
-# yfinance tickers to snapshot
-_PRICE_TICKERS: Dict[str, str] = {
-    "BTC-USD":   "BTC",
-    "ETH-USD":   "ETH",
-    "^NSEI":     "NIFTY",
-    "^GSPC":     "SPY",
-    "GC=F":      "GOLD",
-    "CL=F":      "WTI",
-    "DX-Y.NYB":  "DXY",
-    "^VIX":      "VIX",
-}
-
-# Symbols to pull trend context (5d vs 50d MA)
-_TREND_TICKERS = ["BTC-USD", "^NSEI", "^GSPC", "GC=F"]
-
-# Maximum age of cached context (seconds)
 _CACHE_TTL_SECONDS = 900  # 15 minutes
 
-# ---------------------------------------------------------------------------
-# Simple in-process cache
-# ---------------------------------------------------------------------------
 
 @dataclass
-class _CachedContext:
-    context: "MarketContext"
+class _CachedPayload:
+    market: Dict
+    news: List[Dict]
+    theory: List[Dict]
     fetched_at: float = field(default_factory=time.time)
 
     def is_fresh(self) -> bool:
         return (time.time() - self.fetched_at) < _CACHE_TTL_SECONDS
 
 
-_cache: Optional[_CachedContext] = None
+_market_cache: Optional[_CachedPayload] = None
 
 
 # ---------------------------------------------------------------------------
-# Price and trend fetcher (yfinance)
+# Live market helpers (yfinance, NewsAPI) — optional
 # ---------------------------------------------------------------------------
 
-def _fetch_prices_and_trends() -> tuple[Dict[str, float], Dict[str, str], str, float, str]:
+def _fetch_live_market() -> Optional[Dict]:
     """
-    Returns: (prices, trends, regime, vix_level, dxy_trend)
-    Falls back to empty dicts on failure.
+    Try to pull a live market snapshot via yfinance.
+    Returns a slim market dict or None on failure.
     """
-    prices: Dict[str, float] = {}
-    trends: Dict[str, str] = {}
-    regime = "neutral"
-    vix_level = 18.0
-    dxy_trend = "flat"
-
     try:
         import yfinance as yf  # type: ignore
 
-        # ── Price snapshot ────────────────────────────────────────────────
-        tickers = list(_PRICE_TICKERS.keys())
-        raw = yf.download(tickers, period="5d", interval="1d", progress=False, auto_adjust=True)
+        raw = yf.download(
+            ["^VIX", "^GSPC", "BTC-USD", "^NSEI"],
+            period="5d", interval="1d",
+            progress=False, auto_adjust=True,
+        )
+        close = raw.get("Close", raw)
 
-        if "Close" in raw.columns:
-            close = raw["Close"]
-        else:
-            close = raw  # single ticker edge case
-
-        for yf_sym, label in _PRICE_TICKERS.items():
+        def _last(sym: str) -> float:
             try:
-                val = float(close[yf_sym].dropna().iloc[-1])
-                prices[label] = round(val, 2)
+                return round(float(close[sym].dropna().iloc[-1]), 2)
             except Exception:
-                pass
+                return 0.0
 
-        vix_level = prices.get("VIX", 18.0)
-        dxy_val = prices.pop("DXY", None)  # DXY is for trend only, not displayed
+        vix = _last("^VIX") or 18.0
+        spy = _last("^GSPC")
+        btc = _last("BTC-USD")
+        nifty = _last("^NSEI")
 
-        # ── Trend context ─────────────────────────────────────────────────
-        for yf_sym in _TREND_TICKERS:
-            label = _PRICE_TICKERS.get(yf_sym, yf_sym)
-            try:
-                hist = yf.download(yf_sym, period="60d", interval="1d",
-                                   progress=False, auto_adjust=True)["Close"].dropna()
-                price_now = float(hist.iloc[-1])
-                ma50 = float(hist.rolling(50).mean().iloc[-1])
-                ma20 = float(hist.rolling(20).mean().iloc[-1])
-                pct_from_50d = ((price_now / ma50) - 1) * 100
-
-                if price_now > ma50 * 1.05:
-                    trend_str = f"above 50d MA (+{pct_from_50d:.1f}%)"
-                elif price_now > ma50:
-                    trend_str = f"just above 50d MA (+{pct_from_50d:.1f}%)"
-                elif price_now > ma50 * 0.95:
-                    trend_str = f"just below 50d MA ({pct_from_50d:.1f}%)"
-                else:
-                    trend_str = f"below 50d MA ({pct_from_50d:.1f}%)"
-
-                # Add overbought/oversold context
-                if price_now > ma20 * 1.10:
-                    trend_str += ", extended"
-                elif price_now < ma20 * 0.90:
-                    trend_str += ", oversold"
-
-                trends[label] = trend_str
-            except Exception as exc:
-                logger.debug("Trend fetch failed for %s: %s", yf_sym, exc)
-
-        # ── Market regime ─────────────────────────────────────────────────
-        spy_price = prices.get("SPY", 0)
-        nifty_price = prices.get("NIFTY", 0)
-
-        if vix_level > 30:
+        # Simple regime logic
+        if vix > 30:
             regime = "volatile"
-        elif vix_level < 14:
-            regime = "bull"  # calm markets typically in uptrend
-        elif spy_price > 0 and "SPY" in trends and "above" in trends.get("SPY", ""):
+        elif vix < 14 and spy > 0:
             regime = "bull"
         else:
             regime = "neutral"
 
-        # ── DXY trend ─────────────────────────────────────────────────────
-        if dxy_val:
-            try:
-                hist_dxy = yf.download("DX-Y.NYB", period="30d", interval="1d",
-                                       progress=False, auto_adjust=True)["Close"].dropna()
-                dxy_1m_change = (float(hist_dxy.iloc[-1]) / float(hist_dxy.iloc[0]) - 1) * 100
-                if dxy_1m_change > 1.5:
-                    dxy_trend = "rising"
-                elif dxy_1m_change < -1.5:
-                    dxy_trend = "falling"
-                else:
-                    dxy_trend = "flat"
-            except Exception:
-                pass
+        # Pick the most query-relevant asset (BTC if crypto context, else SPY)
+        asset = "BTC" if btc > 0 else "SPY"
+        price = btc if btc > 0 else spy
 
-    except ImportError:
-        logger.info("yfinance not installed — using fallback prices")
+        return {
+            "regime": regime,
+            "asset":  asset,
+            "price":  price,
+            "trend":  "above 50d MA" if regime == "bull" else "near 50d MA",
+            "vix":    vix,
+        }
     except Exception as exc:
-        logger.warning("Price fetch failed: %s", exc)
+        logger.debug("_fetch_live_market failed: %s", exc)
+        return None
 
-    return prices, trends, regime, vix_level, dxy_trend
 
-
-# ---------------------------------------------------------------------------
-# News fetcher (NewsAPI)
-# ---------------------------------------------------------------------------
-
-def _fetch_news(max_headlines: int = 8) -> List[str]:
+def _fetch_live_news(max_items: int = 3) -> List[Dict]:
     """
-    Pulls recent market-relevant headlines.
-    Falls back to curated static headlines if NewsAPI unavailable.
+    Try NewsAPI for recent headlines. Falls back to static stubs.
+    Returns max 3 slim news dicts.
     """
     api_key = os.getenv("NEWSAPI_KEY", "")
 
     if api_key:
         try:
             import requests  # type: ignore
+
             queries = [
-                "stock market Federal Reserve",
-                "India NIFTY Sensex economy",
-                "Bitcoin cryptocurrency",
-                "oil gold commodities",
+                ("stock market Federal Reserve", ["SPY", "TLT"]),
+                ("India NIFTY Sensex economy",   ["NIFTY", "INFY"]),
+                ("Bitcoin cryptocurrency ETF",   ["BTC", "ETH"]),
             ]
-            headlines: List[str] = []
-            for q in queries:
+            items: List[Dict] = []
+            for q, affected in queries:
+                if len(items) >= max_items:
+                    break
                 url = (
                     "https://newsapi.org/v2/everything"
-                    f"?q={q}&sortBy=publishedAt&pageSize=2"
+                    f"?q={q}&sortBy=publishedAt&pageSize=1"
                     f"&language=en&apiKey={api_key}"
                 )
-                resp = requests.get(url, timeout=5)
+                resp = requests.get(url, timeout=4)
                 if resp.status_code == 200:
-                    for article in resp.json().get("articles", []):
-                        title = article.get("title", "").strip()
-                        source = article.get("source", {}).get("name", "")
-                        if title and len(title) > 20:
-                            headlines.append(f"[{source}] {title}")
-            return headlines[:max_headlines]
+                    articles = resp.json().get("articles", [])
+                    if articles:
+                        title = articles[0].get("title", "").strip()[:120]
+                        if title:
+                            items.append({
+                                "headline": title,
+                                "impact":   "neutral",
+                                "affected": affected,
+                            })
+            if items:
+                return items[:max_items]
         except Exception as exc:
-            logger.warning("NewsAPI fetch failed: %s — using static fallback", exc)
+            logger.debug("_fetch_live_news failed: %s", exc)
 
-    # ── Static fallback headlines ──────────────────────────────────────────
-    # These are representative but NOT real-time. LLM will be instructed
-    # to use them as format examples and augment with its own knowledge.
+    # Static fallback — representative, not real-time
     return [
-        "[Fallback] Federal Reserve holds rates; signals data-dependent path for cuts",
-        "[Fallback] India Q1 GDP growth at 7.8%; beats consensus estimate of 7.2%",
-        "[Fallback] OPEC+ extends production cuts through next quarter",
-        "[Fallback] BTC ETF inflows accelerate; institutional allocation rising",
-        "[Fallback] US Non-Farm Payrolls: 180k vs 210k expected — mild miss",
-        "[Fallback] China manufacturing PMI at 49.8 — near contraction territory",
-        "[Fallback] RBI holds repo rate at 6.5%; maintains withdrawal of accommodation",
-        "[Fallback] Gold at multi-month high on geopolitical tensions",
-    ][:max_headlines]
+        {
+            "headline": "Federal Reserve holds rates; signals data-dependent path for cuts",
+            "impact":   "bearish_bonds",
+            "affected": ["TLT", "SPY", "DXY"],
+        },
+        {
+            "headline": "OPEC+ extends production cuts — oil supply tightens",
+            "impact":   "bullish_oil",
+            "affected": ["WTI", "XLE", "USO"],
+        },
+        {
+            "headline": "Bitcoin ETF inflows accelerate; institutional allocation rising",
+            "impact":   "bullish_crypto",
+            "affected": ["BTC", "ETH", "IBIT"],
+        },
+    ][:max_items]
 
 
 # ---------------------------------------------------------------------------
-# User profile builder
+# User weakness helper
 # ---------------------------------------------------------------------------
 
-def _build_user_profile(
-    user_level: int,
-    portfolio_allocation: Optional[str],
-    history_summary: Optional[str],
-) -> tuple[str, str]:
+_WEAKNESS_MAP = {
+    1: "basic risk management",
+    2: "macro awareness",
+    3: "options Greeks application",
+    4: "portfolio-level hedging",
+    5: "cross-asset synthesis",
+    20: "global macro regime identification",
+}
+
+
+def _top_weakness(user_id: int, level: int, db=None) -> str:
     """
-    Returns (portfolio_str, history_str) for MarketContext.
-    Uses defaults if not provided.
+    Return the single most relevant weakness for this user.
+    Uses DB history if available, otherwise falls back to level default.
     """
-    default_portfolios = {
-        1: "60% Large-cap stocks, 30% Cash, 10% Gold",
-        2: "45% Stocks (mix large/mid), 25% Crypto, 20% ETFs, 10% Cash",
-        3: "35% Stocks, 20% Crypto, 20% Derivatives/Futures, 15% Commodities, 10% Cash",
-        4: "40% Long/Short Equity, 20% Derivatives, 20% Fixed Income, 10% Crypto, 10% Cash",
-        5: "30% Global Macro, 25% Quant Strategies, 20% Alternatives, 15% Bonds, 10% Cash",
-        20: "Multi-asset global: 35% Equities, 20% Bonds, 20% Commodities, 15% Crypto, 10% Cash",
+    if db is not None:
+        try:
+            history = db.get_user_history(user_id, limit=20)
+            if history:
+                # Find the answer with the lowest score and use its question type
+                worst = min(history, key=lambda h: h.get("score", 1.0))
+                score = worst.get("score", 1.0)
+                qtype = worst.get("question_type", "")
+                if score < 0.4 and qtype:
+                    return f"low score on {qtype} questions"
+        except Exception:
+            pass
+    return _WEAKNESS_MAP.get(level, "multi-factor synthesis")
+
+
+# ---------------------------------------------------------------------------
+# Core assembly function
+# ---------------------------------------------------------------------------
+
+def _assemble_context(
+    user_id: int,
+    level: int,
+    db=None,
+    retriever=None,
+    query: str = "market overview",
+    force_refresh: bool = False,
+) -> Dict:
+    """
+    Internal: build the slim context dict.
+    Uses cache for market/news/theory; user block is always live.
+    """
+    global _market_cache
+
+    # ── Market block ──────────────────────────────────────────────────────────
+    if not force_refresh and _market_cache and _market_cache.is_fresh():
+        market_block = _market_cache.market
+        news_block   = _market_cache.news
+        theory_block = _market_cache.theory
+    else:
+        # Try live data first
+        market_block = _fetch_live_market()
+        news_items   = _fetch_live_news(max_items=3)
+
+        # Supplement/override with RAG if available
+        if retriever is not None:
+            rag_market = retriever.get_market_context(query)
+            if market_block is None:
+                market_block = rag_market
+            else:
+                # Merge: keep live price/vix, use RAG regime only as fallback
+                if market_block.get("regime") == "neutral":
+                    market_block["regime"] = rag_market.get("regime", "neutral")
+
+            rag_news = retriever.get_news_context(query)
+            rag_news_items = rag_news.get("items", [])
+            # Merge live + RAG news, dedup by headline prefix, cap at 3
+            seen: set = set()
+            merged: List[Dict] = []
+            for item in news_items + rag_news_items:
+                key = item.get("headline", "")[:40]
+                if key and key not in seen:
+                    seen.add(key)
+                    merged.append(item)
+                if len(merged) >= 3:
+                    break
+            news_items = merged
+
+            rag_theory = retriever.get_theory_context(query)
+            theory_items = [
+                {"name": t["name"], "key_point": t["key_point"]}
+                for t in rag_theory.get("items", [])[:3]
+            ]
+        else:
+            theory_items = []
+
+        # Final market fallback
+        if market_block is None:
+            market_block = {
+                "regime": "neutral",
+                "asset":  "SPY",
+                "price":  0.0,
+                "trend":  "flat",
+                "vix":    18.0,
+            }
+
+        # Enforce schema and types
+        market_block = {
+            "regime": str(market_block.get("regime", "neutral")),
+            "asset":  str(market_block.get("asset",  "unknown")),
+            "price":  float(market_block.get("price", 0.0)),
+            "trend":  str(market_block.get("trend",  "flat")),
+            "vix":    float(market_block.get("vix",   18.0)),
+        }
+        news_block   = news_items[:3]
+        theory_block = theory_items[:3]
+
+        _market_cache = _CachedPayload(
+            market=market_block,
+            news=news_block,
+            theory=theory_block,
+        )
+
+    # ── User block (always fresh) ──────────────────────────────────────────────
+    weakness = _top_weakness(user_id, level, db)
+    user_block = {
+        "level":    level,
+        "weakness": weakness,
     }
 
-    default_history = {
-        1: "New to trading. Strong in basics; needs to develop risk instincts.",
-        2: "Intermediate. Comfortable with technical analysis; macro awareness developing.",
-        3: "Advanced. Familiar with options and derivatives; event-driven thinking.",
-        4: "Expert. Portfolio-level decision maker; systematic approach.",
-        5: "Master. Quantitative and macro expertise. Multi-strategy.",
-        20: "Senior professional. Global macro. Cross-asset synthesis.",
+    return {
+        "market": market_block,
+        "news":   news_block,
+        "theory": theory_block,
+        "user":   user_block,
     }
 
-    portfolio = portfolio_allocation or default_portfolios.get(user_level, default_portfolios[2])
-    history = history_summary or default_history.get(user_level, default_history[2])
 
-    return portfolio, history
+# ---------------------------------------------------------------------------
+# ContextInjector class (used by Bot/main.py)
+# ---------------------------------------------------------------------------
+
+class ContextInjector:
+    """
+    Assembles the slim LLM context dict and converts it to a MarketContext
+    for backwards compatibility with QuestionGenerator.
+
+    Bot/main.py usage:
+        self._context_injector = ContextInjector(db=db)
+        market_context = self._context_injector.build_context(user_id, level)
+    """
+
+    def __init__(self, db=None, retriever=None):
+        self._db = db
+        self._retriever = retriever
+        # Lazy-load retriever from RAG module if not provided
+        if self._retriever is None:
+            try:
+                from Bot.RAG.retriever import RAGRetriever
+                self._retriever = RAGRetriever()
+            except Exception as exc:
+                logger.warning("ContextInjector: could not init RAGRetriever: %s", exc)
+
+    def get_slim_context(
+        self,
+        user_id: int,
+        level: int,
+        query: str = "market overview",
+        force_refresh: bool = False,
+    ) -> Dict:
+        """
+        Return the slim context dict in the canonical output format:
+        {
+          "market": { "regime", "asset", "price", "trend", "vix" },
+          "news":   [ { "headline", "impact", "affected" } ],  // max 3
+          "theory": [ { "name", "key_point" } ],               // max 3
+          "user":   { "level", "weakness" }
+        }
+        """
+        return _assemble_context(
+            user_id=user_id,
+            level=level,
+            db=self._db,
+            retriever=self._retriever,
+            query=query,
+            force_refresh=force_refresh,
+        )
+
+    def build_context(
+        self,
+        user_id: int,
+        level: int,
+        force_refresh: bool = False,
+    ) -> "MarketContext":
+        """
+        Build a MarketContext for the QuestionGenerator.
+        Adapts the slim dict into the MarketContext dataclass.
+        """
+        # Import here to avoid circular dependency
+        from Bot.llm_generator import MarketContext
+
+        slim = self.get_slim_context(user_id, level, force_refresh=force_refresh)
+        mkt = slim["market"]
+        news_items = slim["news"]
+        user = slim["user"]
+
+        # Convert slim news dicts → flat headline strings for MarketContext.news
+        headlines = [
+            f"[{n.get('impact', 'neutral').upper()}] {n.get('headline', '')}"
+            for n in news_items
+        ]
+
+        return MarketContext(
+            regime=mkt["regime"],
+            vix_level=mkt["vix"],
+            dxy_trend="flat",               # not in slim format; use default
+            news=headlines,
+            prices={mkt["asset"]: mkt["price"]} if mkt["price"] > 0 else {},
+            trends={mkt["asset"]: mkt["trend"]} if mkt["trend"] else {},
+            user_level=user["level"],
+            user_portfolio="",              # not in slim format
+            user_history_summary=f"Top weakness: {user['weakness']}",
+        )
+
+    def invalidate_cache(self) -> None:
+        """Force the next call to re-fetch all data."""
+        global _market_cache
+        _market_cache = None
+        logger.info("ContextInjector: cache invalidated")
 
 
 # ---------------------------------------------------------------------------
-# Main public interface
+# Module-level backwards-compatible build_context()
 # ---------------------------------------------------------------------------
+
+_default_injector: Optional[ContextInjector] = None
+
 
 def build_context(
     user_level: int = 1,
@@ -272,65 +410,35 @@ def build_context(
     force_refresh: bool = False,
 ) -> "MarketContext":
     """
-    Build a MarketContext populated with live market data.
+    Backwards-compatible module-level function.
+    Returns a MarketContext (same as before) using the new RAG engine.
 
     Args:
         user_level:           Current user level (1-5, 20).
-        user_id:              User ID (for logging).
-        portfolio_allocation: Override portfolio string (e.g. "50% BTC, 50% Cash").
-        history_summary:      Override user profile string.
-        force_refresh:        Bypass the 15-minute cache.
-
-    Returns:
-        MarketContext ready for injection into question generation.
+        user_id:              User ID.
+        portfolio_allocation: Ignored (kept for signature compat).
+        history_summary:      Ignored (kept for signature compat).
+        force_refresh:        Bypass 15-minute cache.
     """
-    # Import here to avoid circular import (llm_generator imports this module)
-    from llm_generator import MarketContext
-
-    global _cache
-
-    if not force_refresh and _cache and _cache.is_fresh():
-        logger.debug("build_context: returning cached context (age %.0fs)",
-                     time.time() - _cache.fetched_at)
-        # Still update user-specific fields
-        ctx = _cache.context
-        portfolio, history = _build_user_profile(user_level, portfolio_allocation, history_summary)
-        ctx.user_level = user_level
-        ctx.user_portfolio = portfolio
-        ctx.user_history_summary = history
-        return ctx
-
-    logger.info("build_context: fetching fresh market data for user %d level %d", user_id, user_level)
-
-    prices, trends, regime, vix_level, dxy_trend = _fetch_prices_and_trends()
-    news = _fetch_news()
-    portfolio, history = _build_user_profile(user_level, portfolio_allocation, history_summary)
-
-    ctx = MarketContext(
-        regime=regime,
-        vix_level=vix_level,
-        dxy_trend=dxy_trend,
-        news=news,
-        prices=prices,
-        trends=trends,
-        user_level=user_level,
-        user_portfolio=portfolio,
-        user_history_summary=history,
+    global _default_injector
+    if _default_injector is None:
+        _default_injector = ContextInjector()
+    return _default_injector.build_context(
+        user_id=user_id,
+        level=user_level,
+        force_refresh=force_refresh,
     )
-
-    _cache = _CachedContext(context=ctx)
-    logger.info(
-        "build_context: regime=%s VIX=%.1f prices=%d news=%d",
-        regime, vix_level, len(prices), len(news),
-    )
-    return ctx
 
 
 def invalidate_cache() -> None:
     """Force the next call to build_context to re-fetch data."""
-    global _cache
-    _cache = None
-    logger.info("build_context: cache invalidated")
+    global _default_injector
+    if _default_injector is not None:
+        _default_injector.invalidate_cache()
+    else:
+        global _market_cache
+        _market_cache = None
+    logger.info("context_injector: cache invalidated")
 
 
 # ---------------------------------------------------------------------------
@@ -340,11 +448,15 @@ def invalidate_cache() -> None:
 if __name__ == "__main__":
     import json
     logging.basicConfig(level=logging.INFO)
-    ctx = build_context(user_level=2, user_id=999)
-    print("\n=== MARKET CONTEXT ===")
-    print(ctx.to_prompt_block())
-    print("\n=== RAW PRICES ===")
-    print(json.dumps(ctx.prices, indent=2))
-    print("\n=== NEWS HEADLINES ===")
-    for h in ctx.news:
-        print(" •", h)
+
+    injector = ContextInjector()
+    slim = injector.get_slim_context(user_id=999, level=2)
+    print("\n=== SLIM CONTEXT (LLM-ready) ===")
+    print(json.dumps(slim, indent=2))
+
+    serialized = json.dumps(slim, separators=(",", ":"))
+    print(f"\nSerialized length: {len(serialized)} chars (~{len(serialized)//4} tokens)")
+
+    mc = injector.build_context(user_id=999, level=2)
+    print("\n=== MARKET CONTEXT (for QuestionGenerator) ===")
+    print(mc.to_prompt_block())

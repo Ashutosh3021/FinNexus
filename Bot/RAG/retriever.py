@@ -1,54 +1,98 @@
 """
-FinNexus Bot — RAG Retriever
-Retrieves relevant context chunks for a given query from:
-  1. In-memory document store (books / notes loaded at startup)
-  2. Local CSV market data summaries (from Data/Cleaned/)
-  3. (Optional) a vector store via sentence-transformers + FAISS
+FinNexus Bot — RAG Retriever (ChromaDB)
+========================================
+Fetches context from three ChromaDB collections using sentence-transformers
+embeddings (all-MiniLM-L6-v2).
 
-Falls back gracefully to keyword search if heavy deps aren't available.
+Collections:
+  - "market_data"       → market regime, price, trend snippets
+  - "news_events"       → recent market-relevant news entries
+  - "trading_theories"  → finance knowledge (TA, risk, macro theories)
+
+Public API:
+  get_market_context(query)  → slim dict (max 5 fields)
+  get_news_context(query)    → slim dict (max 5 fields)
+  get_theory_context(query)  → slim dict (max 5 fields)
+  get_context_text(query)    → plain text (backwards-compat for SAQEvaluator)
+  embed(texts)               → np.ndarray of embeddings
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import re
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Optional vector search deps ──────────────────────────────────────────────
+# ── ChromaDB ────────────────────────────────────────────────────────────────
 try:
-    import numpy as np
-    from sentence_transformers import SentenceTransformer  # type: ignore
-    import faiss  # type: ignore
-    _VECTOR_SEARCH = True
+    import chromadb  # type: ignore
+    from chromadb.config import Settings  # type: ignore
+    _CHROMA_OK = True
 except ImportError:
-    _VECTOR_SEARCH = False
-    logger.warning("RAG: sentence-transformers/faiss not installed — using keyword search")
+    _CHROMA_OK = False
+    logger.warning("RAG: chromadb not installed — retriever will return empty results")
+
+# ── Embedder ─────────────────────────────────────────────────────────────────
+try:
+    from sentence_transformers import SentenceTransformer  # type: ignore
+    _EMBED_OK = True
+except ImportError:
+    _EMBED_OK = False
+    logger.warning("RAG: sentence-transformers not installed — embeddings disabled")
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_EMBED_MODEL = "all-MiniLM-L6-v2"
+_TOP_K = 3  # hard ceiling — never return more than 3 results per query
+
+# Default ChromaDB persist path (override via CHROMA_PERSIST_PATH env var)
+_PERSIST_PATH = os.getenv(
+    "CHROMA_PERSIST_PATH",
+    str(Path(__file__).parent.parent.parent / "Data" / "chroma_db"),
+)
+
+# Collection names
+_COL_MARKET = "market_data"
+_COL_NEWS = "news_events"
+_COL_THEORY = "trading_theories"
 
 
 # ---------------------------------------------------------------------------
-# Document chunk
+# Embed utility (module-level, reusable by evaluator/injector)
 # ---------------------------------------------------------------------------
 
-class Chunk:
-    __slots__ = ("id", "source", "text", "metadata")
+_embedder: Optional[Any] = None
 
-    def __init__(self, id: str, source: str, text: str, metadata: Dict = None):
-        self.id = id
-        self.source = source
-        self.text = text
-        self.metadata: Dict = metadata or {}
 
-    def to_dict(self) -> Dict:
-        return {
-            "id": self.id,
-            "source": self.source,
-            "text": self.text[:500],  # truncate for API responses
-            "metadata": self.metadata,
-        }
+def _get_embedder() -> Optional[Any]:
+    global _embedder
+    if _embedder is not None:
+        return _embedder
+    if not _EMBED_OK:
+        return None
+    try:
+        _embedder = SentenceTransformer(_EMBED_MODEL)
+        logger.info("RAGRetriever: loaded embedder '%s'", _EMBED_MODEL)
+    except Exception as exc:
+        logger.warning("RAGRetriever: embedder load failed: %s", exc)
+        _embedder = None
+    return _embedder
+
+
+def embed(texts: List[str]) -> Optional[Any]:
+    """
+    Embed a list of strings using all-MiniLM-L6-v2.
+    Returns numpy array of shape (N, 384) or None if embedder unavailable.
+    """
+    model = _get_embedder()
+    if model is None:
+        return None
+    return model.encode(texts, show_progress_bar=False)
 
 
 # ---------------------------------------------------------------------------
@@ -57,216 +101,347 @@ class Chunk:
 
 class RAGRetriever:
     """
-    Stores documents as chunks and retrieves top-k most relevant ones
-    for a query, using either vector similarity or keyword overlap.
+    ChromaDB-backed retriever with three domain-specific fetch methods.
+    Falls back to empty results if ChromaDB/embedder is unavailable.
     """
 
-    def __init__(self, embed_model: str = "all-MiniLM-L6-v2"):
-        self._chunks: List[Chunk] = []
-        self._embed_model_name = embed_model
-        self._embedder: Optional[Any] = None
-        self._index: Optional[Any] = None  # FAISS index
-        self._index_dirty = False           # needs rebuild after new docs
+    def __init__(
+        self,
+        persist_path: str = _PERSIST_PATH,
+        embed_model: str = _EMBED_MODEL,
+    ):
+        self._persist_path = persist_path
+        self._client: Optional[Any] = None
+        self._collections: Dict[str, Any] = {}
+        self._init_client()
+        self._ensure_collections()
+        self._seed_builtin_knowledge()
 
-        self._init_embedder()
-        self._load_builtin_knowledge()
+    # ── Initialise ChromaDB client ────────────────────────────────────────────
 
-    # ── Initialise embedder ───────────────────────────────────────────────────
-
-    def _init_embedder(self) -> None:
-        if not _VECTOR_SEARCH:
+    def _init_client(self) -> None:
+        if not _CHROMA_OK:
             return
         try:
-            self._embedder = SentenceTransformer(self._embed_model_name)
-            logger.info("RAGRetriever: loaded embedder '%s'", self._embed_model_name)
+            Path(self._persist_path).mkdir(parents=True, exist_ok=True)
+            self._client = chromadb.PersistentClient(
+                path=self._persist_path,
+                settings=Settings(anonymized_telemetry=False),
+            )
+            logger.info("RAGRetriever: ChromaDB connected at %s", self._persist_path)
         except Exception as exc:
-            logger.warning("RAGRetriever: embedder load failed: %s", exc)
-            self._embedder = None
+            logger.warning("RAGRetriever: ChromaDB init failed: %s", exc)
+            self._client = None
 
-    # ── Built-in knowledge base ───────────────────────────────────────────────
+    # ── Ensure collections exist ──────────────────────────────────────────────
 
-    def _load_builtin_knowledge(self) -> None:
-        """Seed the retriever with core finance knowledge chunks."""
-        knowledge = _BUILTIN_KNOWLEDGE
-        for i, (source, text) in enumerate(knowledge):
-            self.add_chunk(Chunk(id=f"builtin_{i}", source=source, text=text))
-        logger.info("RAGRetriever: loaded %d built-in knowledge chunks", len(knowledge))
+    def _ensure_collections(self) -> None:
+        if self._client is None:
+            return
+        for name in (_COL_MARKET, _COL_NEWS, _COL_THEORY):
+            try:
+                col = self._client.get_or_create_collection(
+                    name=name,
+                    metadata={"hnsw:space": "cosine"},
+                )
+                self._collections[name] = col
+            except Exception as exc:
+                logger.warning("RAGRetriever: failed to get/create collection '%s': %s", name, exc)
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Seed built-in finance knowledge ──────────────────────────────────────
 
-    def add_chunk(self, chunk: Chunk) -> None:
-        self._chunks.append(chunk)
-        self._index_dirty = True
+    def _seed_builtin_knowledge(self) -> None:
+        """Seed trading_theories collection if empty."""
+        col = self._collections.get(_COL_THEORY)
+        if col is None:
+            return
+        try:
+            if col.count() > 0:
+                return  # already seeded
+        except Exception:
+            return
 
-    def add_text(self, text: str, source: str = "user_doc", chunk_size: int = 400) -> int:
-        """Split text into chunks and add all. Returns count added."""
-        parts = _split_text(text, chunk_size)
-        for i, part in enumerate(parts):
-            self.add_chunk(Chunk(
-                id=f"{source}_{i}",
-                source=source,
-                text=part,
-            ))
-        return len(parts)
+        ids, docs, metas = [], [], []
+        for i, (source, text) in enumerate(_BUILTIN_THEORIES):
+            ids.append(f"theory_{i}")
+            docs.append(text)
+            metas.append({"source": source})
 
-    def load_jsonl(self, path: str | Path) -> int:
-        """Load chunks from a JSONL file where each line is a Chunk dict."""
-        count = 0
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                d = json.loads(line)
-                self.add_chunk(Chunk(
-                    id=d.get("id", f"jsonl_{count}"),
-                    source=d.get("source", str(path)),
-                    text=d["text"],
-                    metadata=d.get("metadata", {}),
-                ))
-                count += 1
-        logger.info("RAGRetriever: loaded %d chunks from %s", count, path)
-        return count
+        embs = embed(docs)
+        try:
+            if embs is not None:
+                col.add(
+                    ids=ids,
+                    documents=docs,
+                    embeddings=embs.tolist(),
+                    metadatas=metas,
+                )
+            else:
+                col.add(ids=ids, documents=docs, metadatas=metas)
+            logger.info("RAGRetriever: seeded %d theory chunks", len(ids))
+        except Exception as exc:
+            logger.warning("RAGRetriever: seed failed: %s", exc)
 
-    def retrieve(self, query: str, top_k: int = 5) -> List[Chunk]:
-        """Return top_k most relevant chunks for query."""
-        if not self._chunks:
+    # ── Domain fetch methods ──────────────────────────────────────────────────
+
+    def get_market_context(self, query: str) -> Dict:
+        """
+        Fetch top-3 market_data chunks for query.
+        Returns slim dict with max 5 fields.
+        """
+        results = self._query_collection(_COL_MARKET, query)
+        if not results:
+            return {
+                "regime": "neutral",
+                "asset": "unknown",
+                "price": 0.0,
+                "trend": "flat",
+                "vix": 18.0,
+            }
+
+        # Parse first result for structured fields, use rest as trend context
+        top = results[0]
+        meta = top.get("metadata", {})
+        return {
+            "regime":  meta.get("regime", "neutral"),
+            "asset":   meta.get("asset", top.get("id", "unknown")),
+            "price":   float(meta.get("price", 0.0)),
+            "trend":   meta.get("trend", top.get("text", "")[:80]),
+            "vix":     float(meta.get("vix", 18.0)),
+        }
+
+    def get_news_context(self, query: str) -> Dict:
+        """
+        Fetch top-3 news_events chunks for query.
+        Returns slim dict with max 5 fields.
+        """
+        results = self._query_collection(_COL_NEWS, query)
+        items = []
+        for r in results[:_TOP_K]:
+            meta = r.get("metadata", {})
+            affected_raw = meta.get("affected", "")
+            affected = (
+                affected_raw if isinstance(affected_raw, list)
+                else [a.strip() for a in affected_raw.split(",") if a.strip()]
+            )
+            items.append({
+                "headline": r.get("text", "")[:120],
+                "impact":   meta.get("impact", "neutral"),
+                "affected": affected[:3],  # cap list length
+            })
+        return {
+            "items":  items,
+            "count":  len(items),
+            "query":  query[:60],
+            "source": _COL_NEWS,
+            "top_k":  _TOP_K,
+        }
+
+    def get_theory_context(self, query: str) -> Dict:
+        """
+        Fetch top-3 trading_theories chunks for query.
+        Returns slim dict with max 5 fields.
+        """
+        results = self._query_collection(_COL_THEORY, query)
+        items = []
+        for r in results[:_TOP_K]:
+            meta = r.get("metadata", {})
+            text = r.get("text", "")
+            # Extract first sentence as key_point
+            key_point = text.split(".")[0].strip()[:120] if text else ""
+            items.append({
+                "name":      meta.get("source", r.get("id", "theory")),
+                "key_point": key_point,
+            })
+        return {
+            "items":  items,
+            "count":  len(items),
+            "query":  query[:60],
+            "source": _COL_THEORY,
+            "top_k":  _TOP_K,
+        }
+
+    # ── Backwards-compatible method for SAQEvaluator ─────────────────────────
+
+    def get_context_text(self, query: str, top_k: int = _TOP_K) -> str:
+        """
+        Return retrieved theory + news chunks as plain text.
+        Kept for SAQEvaluator compatibility.
+        top_k is accepted but internally capped at _TOP_K=3.
+        """
+        effective_k = min(top_k, _TOP_K)
+        theory = self._query_collection(_COL_THEORY, query)
+        news = self._query_collection(_COL_NEWS, query)
+
+        combined = (theory + news)[:effective_k]
+        if not combined:
+            return ""
+        return "\n\n---\n\n".join(
+            f"[{r.get('metadata', {}).get('source', 'doc')}] {r.get('text', '')}"
+            for r in combined
+        )
+
+    # ── Upsert helpers (for loading fresh market/news data) ───────────────────
+
+    def upsert_market(
+        self,
+        doc_id: str,
+        text: str,
+        regime: str = "neutral",
+        asset: str = "",
+        price: float = 0.0,
+        trend: str = "",
+        vix: float = 18.0,
+    ) -> None:
+        """Add or update a document in the market_data collection."""
+        self._upsert(_COL_MARKET, doc_id, text, {
+            "regime": regime,
+            "asset":  asset,
+            "price":  price,
+            "trend":  trend,
+            "vix":    vix,
+        })
+
+    def upsert_news(
+        self,
+        doc_id: str,
+        headline: str,
+        impact: str = "neutral",
+        affected: str = "",
+    ) -> None:
+        """Add or update a document in the news_events collection."""
+        self._upsert(_COL_NEWS, doc_id, headline, {
+            "impact":   impact,
+            "affected": affected,
+        })
+
+    def upsert_theory(
+        self,
+        doc_id: str,
+        text: str,
+        source: str = "theory",
+    ) -> None:
+        """Add or update a document in the trading_theories collection."""
+        self._upsert(_COL_THEORY, doc_id, text, {"source": source})
+
+    # ── Internal query helper ─────────────────────────────────────────────────
+
+    def _query_collection(self, collection_name: str, query: str) -> List[Dict]:
+        col = self._collections.get(collection_name)
+        if col is None:
+            return []
+        try:
+            n_results = min(_TOP_K, max(col.count(), 1))
+            emb = embed([query])
+            if emb is not None:
+                result = col.query(
+                    query_embeddings=emb.tolist(),
+                    n_results=n_results,
+                    include=["documents", "metadatas", "distances"],
+                )
+            else:
+                result = col.query(
+                    query_texts=[query],
+                    n_results=n_results,
+                    include=["documents", "metadatas", "distances"],
+                )
+
+            ids    = result.get("ids", [[]])[0]
+            docs   = result.get("documents", [[]])[0]
+            metas  = result.get("metadatas", [[]])[0]
+
+            return [
+                {"id": ids[i], "text": docs[i], "metadata": metas[i]}
+                for i in range(len(ids))
+            ]
+        except Exception as exc:
+            logger.warning("RAGRetriever: query '%s' failed on '%s': %s",
+                           query[:40], collection_name, exc)
             return []
 
-        if _VECTOR_SEARCH and self._embedder:
-            return self._vector_retrieve(query, top_k)
-        return self._keyword_retrieve(query, top_k)
-
-    def get_context_text(self, query: str, top_k: int = 5) -> str:
-        """Convenience: return retrieved chunks as a single string."""
-        chunks = self.retrieve(query, top_k)
-        parts = [f"[{c.source}] {c.text}" for c in chunks]
-        return "\n\n---\n\n".join(parts)
-
-    # ── Vector retrieval ─────────────────────────────────────────────────────
-
-    def _rebuild_index(self) -> None:
-        if not _VECTOR_SEARCH or not self._embedder:
+    def _upsert(self, collection_name: str, doc_id: str, text: str, meta: Dict) -> None:
+        col = self._collections.get(collection_name)
+        if col is None:
+            logger.warning("RAGRetriever: collection '%s' not available", collection_name)
             return
-        texts = [c.text for c in self._chunks]
-        embeddings = self._embedder.encode(texts, show_progress_bar=False)
-        embeddings = embeddings.astype("float32")
-        faiss.normalize_L2(embeddings)
-        dim = embeddings.shape[1]
-        self._index = faiss.IndexFlatIP(dim)  # inner product = cosine after normalise
-        self._index.add(embeddings)
-        self._index_dirty = False
-        logger.debug("RAGRetriever: rebuilt FAISS index with %d vectors", len(texts))
-
-    def _vector_retrieve(self, query: str, top_k: int) -> List[Chunk]:
-        if self._index_dirty:
-            self._rebuild_index()
-        if self._index is None:
-            return self._keyword_retrieve(query, top_k)
-
-        q_emb = self._embedder.encode([query], show_progress_bar=False).astype("float32")
-        faiss.normalize_L2(q_emb)
-        k = min(top_k, len(self._chunks))
-        _, indices = self._index.search(q_emb, k)
-        return [self._chunks[i] for i in indices[0] if 0 <= i < len(self._chunks)]
-
-    # ── Keyword retrieval (fallback) ──────────────────────────────────────────
-
-    def _keyword_retrieve(self, query: str, top_k: int) -> List[Chunk]:
-        query_tokens = set(re.findall(r"\w+", query.lower()))
-        scored: List[tuple[float, Chunk]] = []
-
-        for chunk in self._chunks:
-            chunk_tokens = set(re.findall(r"\w+", chunk.text.lower()))
-            overlap = len(query_tokens & chunk_tokens)
-            if overlap > 0:
-                scored.append((overlap / max(len(query_tokens), 1), chunk))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [c for _, c in scored[:top_k]]
+        try:
+            emb = embed([text])
+            if emb is not None:
+                col.upsert(
+                    ids=[doc_id],
+                    documents=[text],
+                    embeddings=emb.tolist(),
+                    metadatas=[meta],
+                )
+            else:
+                col.upsert(ids=[doc_id], documents=[text], metadatas=[meta])
+        except Exception as exc:
+            logger.warning("RAGRetriever: upsert failed for '%s': %s", doc_id, exc)
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     def stats(self) -> Dict:
+        counts = {}
+        for name, col in self._collections.items():
+            try:
+                counts[name] = col.count()
+            except Exception:
+                counts[name] = -1
         return {
-            "total_chunks": len(self._chunks),
-            "vector_search_available": _VECTOR_SEARCH and self._embedder is not None,
-            "index_built": not self._index_dirty and self._index is not None,
+            "chroma_available":  _CHROMA_OK,
+            "embedder_available": _EMBED_OK,
+            "persist_path":      self._persist_path,
+            "collection_counts": counts,
         }
 
 
 # ---------------------------------------------------------------------------
-# Text splitter
+# Built-in finance knowledge (seed for trading_theories collection)
 # ---------------------------------------------------------------------------
 
-def _split_text(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
-    words = text.split()
-    chunks: List[str] = []
-    start = 0
-    while start < len(words):
-        end = min(start + chunk_size, len(words))
-        chunks.append(" ".join(words[start:end]))
-        start += chunk_size - overlap
-    return chunks
-
-
-# ---------------------------------------------------------------------------
-# Built-in finance knowledge (seed data)
-# ---------------------------------------------------------------------------
-
-_BUILTIN_KNOWLEDGE: List[tuple[str, str]] = [
+_BUILTIN_THEORIES: List[tuple[str, str]] = [
     ("technical_analysis",
-     "RSI (Relative Strength Index) above 70 indicates overbought conditions — a potential reversal zone. "
-     "RSI below 30 indicates oversold conditions — a potential bounce zone. "
-     "RSI is a momentum oscillator ranging 0-100, computed over a 14-period default window."),
+     "RSI above 70 indicates overbought conditions — potential reversal zone. "
+     "RSI below 30 indicates oversold — potential bounce zone. "
+     "Computed over a 14-period default window, range 0-100."),
 
-    ("technical_analysis",
-     "Moving averages smooth price action. The 200-day MA is a key long-term trend indicator. "
-     "Price above the 200-day MA is bullish; below is bearish. "
-     "A golden cross (50-day crossing above 200-day) is a bullish signal. "
-     "A death cross (50-day crossing below 200-day) is a bearish signal."),
+    ("moving_averages",
+     "The 200-day MA is the key long-term trend indicator. Price above = bullish. "
+     "Golden cross (50d over 200d) is bullish. Death cross (50d under 200d) is bearish."),
 
     ("options_greeks",
-     "Options Greeks: Delta measures price sensitivity to underlying. Gamma is rate of Delta change. "
-     "Theta is daily time decay — options lose value each day they are held. "
-     "Vega measures sensitivity to implied volatility changes. Rho measures interest rate sensitivity."),
+     "Delta = price sensitivity to underlying. Gamma = rate of Delta change. "
+     "Theta = daily time decay. Vega = sensitivity to implied volatility. "
+     "Rho = interest rate sensitivity."),
 
     ("futures_basis",
-     "Futures basis = Futures price - Spot price. A positive basis (contango) means futures trade at a premium "
-     "reflecting carrying costs (interest, storage). A negative basis (backwardation) means futures trade at a "
-     "discount, usually signalling strong immediate demand. Nifty futures typically trade at a premium equal to "
-     "the risk-free rate times time to expiry."),
+     "Futures basis = Futures price - Spot price. Positive basis = contango (futures premium). "
+     "Negative basis = backwardation (futures discount, strong immediate demand). "
+     "Nifty futures trade at premium equal to risk-free rate × time to expiry."),
 
     ("macro_correlations",
-     "Gold and USD typically have an inverse relationship — a strong dollar suppresses gold prices. "
-     "When both gold and USD rise together it often signals a flight to safety in a crisis. "
-     "Gold is also inversely correlated to real interest rates: higher real rates reduce gold appeal."),
+     "Gold and USD are inversely correlated. Strong dollar suppresses gold. "
+     "Gold rises with real interest rate declines. Both gold and USD rising signals crisis."),
 
     ("crypto_fundamentals",
-     "Bitcoin on-chain metrics: HODL waves track coin age distribution. Whale wallet accumulation (wallets > 1000 BTC) "
-     "is a bullish signal. Exchange inflows signal selling intent. The Stock-to-Flow model relates Bitcoin scarcity to price. "
-     "Bitcoin halving events (every ~4 years) reduce new supply, historically preceding bull runs."),
+     "Bitcoin halving (every ~4 years) reduces new supply. Exchange inflows signal selling. "
+     "Whale wallet accumulation (>1000 BTC) is bullish. Stock-to-Flow models scarcity."),
 
     ("india_equities",
-     "Nifty 50 is the benchmark index of the NSE comprising 50 large-cap Indian companies. "
-     "FII (Foreign Institutional Investor) flows heavily influence direction — sustained FII buying is bullish. "
-     "Bank Nifty is the banking sector index. Q1 earnings season (April-July) is a key catalyst. "
-     "RBI monetary policy decisions impact rate-sensitive sectors: banking, real estate, auto."),
+     "Nifty 50 = 50 large-cap NSE stocks. FII sustained buying is bullish. "
+     "Bank Nifty is the banking index. RBI policy impacts banking, real estate, auto."),
 
     ("candlestick_patterns",
-     "Doji: open ≈ close, long wicks — signals indecision. Hammer: small body, long lower wick at bottom of downtrend — bullish reversal. "
-     "Shooting Star: small body, long upper wick at top of uptrend — bearish reversal. "
-     "Engulfing: large candle envelops prior candle — bullish or bearish depending on direction. "
-     "Marubozu: no wicks, full body — strong directional conviction."),
+     "Doji = indecision. Hammer at downtrend bottom = bullish reversal. "
+     "Shooting star at uptrend top = bearish reversal. "
+     "Engulfing candle signals directional shift. Marubozu = strong conviction."),
 
     ("risk_management",
-     "Position sizing: risk no more than 1-2% of capital per trade. Stop-loss placement below key support. "
-     "Risk-reward ratio: aim for at least 1:2. Diversification across uncorrelated assets reduces portfolio volatility. "
-     "Volatility-adjusted position sizing: reduce size in high-VIX environments."),
+     "Risk 1-2% of capital per trade. Stop-loss below key support. "
+     "Aim for 1:2 risk-reward minimum. Reduce position size in high-VIX environments."),
 
-    ("global_events_level20",
-     "Level 20 covers macro global events: Fed rate decisions, geopolitical conflicts, commodity supply shocks, "
-     "central bank interventions, currency crises. These events cause cross-asset contagion and regime shifts. "
-     "A Fed rate hike cycle typically strengthens USD, pressures emerging market currencies, raises bond yields, "
-     "and initially suppresses equities. Oil supply shocks (OPEC cuts, war) are inflationary and affect all assets."),
+    ("global_macro",
+     "Fed rate hike cycle strengthens USD, pressures EM currencies, raises bond yields, "
+     "suppresses equities initially. OPEC supply cuts are inflationary across all assets. "
+     "Geopolitical risk spikes gold and oil simultaneously."),
 ]

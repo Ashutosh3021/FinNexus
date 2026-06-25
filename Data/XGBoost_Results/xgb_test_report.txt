@@ -1,0 +1,51 @@
+============================================================
+FinNexus XGBoost Test Report
+Generated : 2026-06-25 18:03
+Target    : target_7d
+============================================================
+Total models evaluated : 340
+
+[Crypto]  10 assets
+  Avg Accuracy : 0.4727
+  Avg F1       : 0.5851
+  Avg AUC      : 0.5043
+  Best model   : XMR  AUC=0.6564
+
+[ETFs]  15 assets
+  Avg Accuracy : 0.4450
+  Avg F1       : 0.3166
+  Avg AUC      : 0.5246
+  Best model   : USO  AUC=0.6051
+
+[Commodities]  12 assets
+  Avg Accuracy : 0.4950
+  Avg F1       : 0.3901
+  Avg AUC      : 0.5335
+  Best model   : Copper  AUC=0.6456
+
+[Futures]  10 assets
+  Avg Accuracy : 0.4548
+  Avg F1       : 0.5491
+  Avg AUC      : 0.5881
+  Best model   : HDFC_BANK_Futures  AUC=0.7235
+
+[Stocks]  293 assets
+  Avg Accuracy : 0.5118
+  Avg F1       : 0.4472
+  Avg AUC      : 0.5482
+  Best model   : NNext_HAVELLS  AUC=0.7192
+
+── Top 10 by Test AUC ──
+asset_class               symbol      auc       f1  accuracy  n_test
+    Futures    HDFC_BANK_Futures 0.723512 0.490566  0.346774     124
+     Stocks        NNext_HAVELLS 0.719199 0.618182  0.551601     281
+     Stocks          NMidcap_ACC 0.711447 0.576720  0.430605     281
+     Stocks          N50_DRREDDY 0.706356 0.548523  0.619217     281
+     Stocks    NSmallcap_DRREDDY 0.706356 0.548523  0.619217     281
+     Stocks     NNext_PIDILITIND 0.706306 0.686391  0.622776     281
+     Stocks NSmallcap_CEREBRAINT 0.705485 0.655052  0.647687     281
+    Futures     NIFTY_50_Options 0.685897 0.525000  0.387097     124
+    Futures     NIFTY_50_Futures 0.685897 0.525000  0.387097     124
+     Stocks     NMidcap_PRESTIGE 0.684020 0.610738  0.587189     281
+
+============================================================

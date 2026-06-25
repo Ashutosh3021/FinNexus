@@ -1,0 +1,50 @@
+============================================================
+FinNexus XGBoost Training Report
+Generated : 2026-06-25 17:48
+Target    : target_7d
+CV Splits : 5
+============================================================
+
+Total models trained : 341
+
+[Crypto]  10 assets
+  Avg Accuracy : 0.5225
+  Avg F1       : 0.4451
+  Avg AUC      : 0.6081
+  Best model   : SOL  AUC=0.6675
+
+[ETFs]  15 assets
+  Avg Accuracy : 0.5113
+  Avg F1       : 0.4625
+  Avg AUC      : 0.5744
+  Best model   : XLV  AUC=0.6774
+
+[Commodities]  13 assets
+  Avg Accuracy : 0.5165
+  Avg F1       : 0.5097
+  Avg AUC      : 0.5593
+  Best model   : WTI_Crude_Oil  AUC=0.6304
+
+[Futures]  10 assets
+  Avg Accuracy : 0.4839
+  Avg F1       : 0.4431
+  Avg AUC      : 0.5967
+  Best model   : NIFTY_50_Options  AUC=0.7228
+
+[Stocks]  293 assets
+  Avg Accuracy : 0.5044
+  Avg F1       : 0.4346
+  Avg AUC      : 0.5712
+  Best model   : NSmallcap_DOMS  AUC=0.7004
+
+── Global Best (top 5 by AUC) ──
+asset_class               symbol   cv_auc    cv_f1  cv_accuracy
+    Futures     NIFTY_50_Options 0.722795 0.507446     0.473171
+    Futures     NIFTY_50_Futures 0.722795 0.507446     0.473171
+     Stocks       NSmallcap_DOMS 0.700404 0.634893     0.578313
+     Stocks NSmallcap_EASEMYTRIP 0.696452 0.566459     0.568715
+       ETFs                  XLV 0.677396 0.490832     0.551613
+
+Models saved to:
+C:\Users\ashut\Downloads\OnGoingProjects\FinNexus\Data\XGBoost_Results\models
+============================================================

@@ -9,3 +9,5 @@ Train/
 Test/
 Notebooks/catboost_info
 __init__.py
+.env
+*.env

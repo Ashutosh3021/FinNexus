@@ -8,3 +8,4 @@ Reports/
 Train/
 Test/
 Notebooks/catboost_info
+__init__.py

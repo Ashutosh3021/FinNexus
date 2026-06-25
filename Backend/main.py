@@ -3,6 +3,9 @@ FinNexus — FastAPI Backend
 Exposes the FinnexusBot as a REST API.
 All endpoints return JSON.  No auth middleware — add JWT/API-key layer on top.
 
+All LLM, RAG, and ML logic goes through Bot/main.py ONLY.
+No direct LLM or RAG calls from this file.
+
 Run:
     uvicorn Backend.main:app --reload --port 8000
 """
@@ -196,18 +199,91 @@ def assess_starting_level(req: AssessRequest) -> Dict:
 
 @app.get("/rag/stats", tags=["RAG"])
 def rag_stats() -> Dict:
-    """Return RAG retriever chunk stats."""
+    """Return RAG retriever collection stats."""
     return bot._evaluator.retriever.stats()
 
 
 @app.get("/rag/retrieve", tags=["RAG"])
 def rag_retrieve(
     query: str = Query(..., description="Search query"),
-    top_k: int = Query(5, ge=1, le=20),
+    collection: str = Query("trading_theories", description="market_data|news_events|trading_theories"),
 ) -> Dict:
-    """Retrieve top-k relevant context chunks for a query."""
-    chunks = bot._evaluator.retriever.retrieve(query, top_k=top_k)
-    return {"query": query, "results": [c.to_dict() for c in chunks]}
+    """
+    Retrieve top-3 context chunks for a query from the specified collection.
+    Routes to the appropriate domain method on RAGRetriever.
+    """
+    try:
+        retriever = bot._evaluator.retriever
+        if collection == "market_data":
+            result = retriever.get_market_context(query)
+        elif collection == "news_events":
+            result = retriever.get_news_context(query)
+        else:
+            result = retriever.get_theory_context(query)
+        return {"query": query, "collection": collection, "result": result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── V2 async endpoints ─────────────────────────────────────────────────────────
+
+class StartSessionV2Request(BaseModel):
+    user_id: int = Field(..., description="Unique user identifier")
+    level: int = Field(1, ge=1, le=20, description="Level 1-5 or 20 for global events")
+    force_new: bool = Field(False, description="Force a brand-new session")
+
+
+class SubmitAnswersV2Request(BaseModel):
+    session_id: str = Field(..., description="Session ID from start_session_v2")
+    answers: Dict[str, Any] = Field(
+        ..., description="Map of question_id → answer value (index int for MCQ, str for SAQ)"
+    )
+
+
+@app.post("/v2/session/start", tags=["Session V2"])
+async def start_session_v2(req: StartSessionV2Request) -> Dict:
+    """
+    Async session start. Returns session_id + all 19 questions.
+    Context and question generation happen via the full RAG pipeline.
+    """
+    try:
+        session_id, questions = await bot.async_start_session(
+            user_id=req.user_id,
+            level=req.level,
+            force_new=req.force_new,
+        )
+        return {
+            "session_id": session_id,
+            "level": req.level,
+            "total_questions": len(questions),
+            "questions": questions,
+        }
+    except Exception as exc:
+        logger.error("start_session_v2 error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/v2/session/answers", tags=["Session V2"])
+async def submit_answers_v2(req: SubmitAnswersV2Request) -> Dict:
+    """
+    Submit all (or partial) answers for a session.
+    When all 19 answers are received, runs Steps 3-5:
+      - RAG-based scoring (evaluate_answers)
+      - HITL feature extraction
+      - DB + ML update
+    Returns score, reward, level_result, and hitl_features.
+    """
+    try:
+        result = await bot.async_submit_answers(
+            session_id=req.session_id,
+            answers=req.answers,
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("submit_answers_v2 error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ── Entry point (dev) ──────────────────────────────────────────────────────────

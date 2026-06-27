@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useAppStore } from '../store/useAppStore'
-import { PriceChart } from '../components/ui/PriceChart'
+import { CandleChart } from '../components/ui/CandleChart'   // ← replaces PriceChart
 import { cn } from '../lib/utils'
 import { Wallet, TrendingUp, TrendingDown, Minus, Bot, ChevronDown } from 'lucide-react'
 import type { Asset, PaperTrade } from '../types'
@@ -32,7 +32,6 @@ export function PaperTradingPage() {
       botAction,
     }
     executeTrade(trade as Parameters<typeof executeTrade>[0])
-    // Simulate resolved trade for demo
     const resolved: PaperTrade = {
       ...trade,
       id: `trade-${Date.now()}`,
@@ -78,6 +77,7 @@ export function PaperTradingPage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* Trading panel */}
         <div className="lg:col-span-2 space-y-4">
+
           {/* Asset selector */}
           <div className="bg-surface-container-low rounded-xl border border-outline-variant/15 p-4">
             <label className="text-xs font-headline text-on-surface-variant uppercase tracking-wider block mb-2">Select Asset</label>
@@ -118,10 +118,11 @@ export function PaperTradingPage() {
             </div>
           </div>
 
-          {/* Chart */}
-          <PriceChart
+          {/* ── Candle chart (replaces PriceChart) ─────────────────────────── */}
+          <CandleChart
             data={selectedAsset.chartData}
-            color={selectedAsset.change >= 0 ? '#10b981' : '#ef4444'}
+            candles={30}
+            height={220}
           />
 
           {/* Bot vs User panel */}
@@ -245,6 +246,8 @@ export function PaperTradingPage() {
     </div>
   )
 }
+
+// ─── Sub-components (unchanged) ───────────────────────────────────────────────
 
 function TradeButton({ label, icon, color, disabled, onClick }: {
   label: string; icon: React.ReactNode; color: 'primary' | 'tertiary' | 'error'; disabled?: boolean; onClick: () => void

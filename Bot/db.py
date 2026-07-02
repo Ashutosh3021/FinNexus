@@ -92,6 +92,17 @@ class BotDB:
     def get_paper_cash(self, user_id: int) -> int:
         raise NotImplementedError
 
+    # ── User profile ─────────────────────────────────────────────────────────
+
+    def get_user_profile(self, user_id: int) -> Dict:
+        raise NotImplementedError
+
+    def save_user_profile(self, user_id: int, **fields: Any) -> Dict:
+        raise NotImplementedError
+
+    def increment_session_count(self, user_id: int) -> None:
+        raise NotImplementedError
+
 
 # ---------------------------------------------------------------------------
 # Supabase implementation
@@ -251,12 +262,64 @@ class SupabaseDB(BotDB):
         )
         return result.data.get("paper_cash", 0) if result.data else 0
 
+    def get_user_profile(self, user_id: int) -> Dict:
+        result = (
+            self._table("users")
+            .select("*")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if result.data:
+            return result.data[0]
+        return self._default_profile(user_id)
+
+    def save_user_profile(self, user_id: int, **fields: Any) -> Dict:
+        fields["updated_at"] = _now_iso()
+        self._table("users").upsert({"id": user_id, **fields}, on_conflict="id").execute()
+        return self.get_user_profile(user_id)
+
+    def increment_session_count(self, user_id: int) -> None:
+        profile = self.get_user_profile(user_id)
+        count = int(profile.get("total_sessions", 0)) + 1
+        self.save_user_profile(user_id, total_sessions=count)
+
+    @staticmethod
+    def _default_profile(user_id: int) -> Dict:
+        return {
+            "id": user_id,
+            "name": "",
+            "email": "",
+            "paper_cash": 0,
+            "current_level": 1,
+            "proficiency": 0.0,
+            "highest_level_completed": 0,
+            "level_20_completed": 0,
+            "level_20_completed_at": None,
+            "total_sessions": 0,
+        }
+
 
 # ---------------------------------------------------------------------------
 # SQLite fallback (dev / unit tests)
 # ---------------------------------------------------------------------------
 
 _SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    name TEXT DEFAULT '',
+    email TEXT DEFAULT '',
+    paper_cash INTEGER DEFAULT 0,
+    current_level INTEGER DEFAULT 1,
+    proficiency REAL DEFAULT 0.0,
+    highest_level_completed INTEGER DEFAULT 0,
+    level_20_completed INTEGER DEFAULT 0,
+    level_20_completed_at TEXT,
+    total_sessions INTEGER DEFAULT 0,
+    created_at TEXT,
+    updated_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS bot_sessions (
     id TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
@@ -292,13 +355,6 @@ CREATE TABLE IF NOT EXISTS user_bot_progress (
     next_level_unlocked INTEGER DEFAULT 0,
     UNIQUE(user_id, level_completed)
 );
-
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
-    name TEXT,
-    email TEXT,
-    paper_cash INTEGER DEFAULT 0
-);
 """
 
 
@@ -310,8 +366,26 @@ class SQLiteDB(BotDB):
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SQLITE_SCHEMA)
+        self._migrate_sqlite_schema()
         self._conn.commit()
         logger.info("SQLiteDB initialised at %s", db_path)
+
+    def _migrate_sqlite_schema(self) -> None:
+        """Add profile columns to legacy databases."""
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(users)").fetchall()}
+        migrations = [
+            ("current_level", "INTEGER DEFAULT 1"),
+            ("proficiency", "REAL DEFAULT 0.0"),
+            ("highest_level_completed", "INTEGER DEFAULT 0"),
+            ("level_20_completed", "INTEGER DEFAULT 0"),
+            ("level_20_completed_at", "TEXT"),
+            ("total_sessions", "INTEGER DEFAULT 0"),
+            ("created_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        ]
+        for col, typedef in migrations:
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} {typedef}")
 
     def _q(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         return self._conn.execute(sql, params)
@@ -450,6 +524,31 @@ class SQLiteDB(BotDB):
             "SELECT paper_cash FROM users WHERE id=?", (user_id,)
         ).fetchone()
         return row["paper_cash"] if row else 0
+
+    def get_user_profile(self, user_id: int) -> Dict:
+        row = self._q("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if row:
+            return dict(row)
+        return SupabaseDB._default_profile(user_id)
+
+    def save_user_profile(self, user_id: int, **fields: Any) -> Dict:
+        now = _now_iso()
+        self._q(
+            "INSERT OR IGNORE INTO users(id, paper_cash, current_level, created_at, updated_at) "
+            "VALUES(?, 0, 1, ?, ?)",
+            (user_id, now, now),
+        )
+        if fields:
+            fields["updated_at"] = now
+            sets = ", ".join(f"{k}=?" for k in fields)
+            vals = list(fields.values()) + [user_id]
+            self._q(f"UPDATE users SET {sets} WHERE id=?", tuple(vals))
+        self._commit()
+        return self.get_user_profile(user_id)
+
+    def increment_session_count(self, user_id: int) -> None:
+        profile = self.get_user_profile(user_id)
+        self.save_user_profile(user_id, total_sessions=int(profile.get("total_sessions", 0)) + 1)
 
 
 # ---------------------------------------------------------------------------

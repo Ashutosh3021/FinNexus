@@ -51,10 +51,14 @@ _EMBED_MODEL = "all-MiniLM-L6-v2"
 _TOP_K = 3  # hard ceiling — never return more than 3 results per query
 
 # Default ChromaDB persist path (override via CHROMA_PERSIST_PATH env var)
-_PERSIST_PATH = os.getenv(
-    "CHROMA_PERSIST_PATH",
-    str(Path(__file__).parent.parent.parent / "Data" / "chroma_db"),
-)
+try:
+    from Bot import config as _cfg
+    _PERSIST_PATH = str(_cfg.CHROMA_PERSIST_PATH)
+except Exception:
+    _PERSIST_PATH = os.getenv(
+        "CHROMA_PERSIST_PATH",
+        str(Path(__file__).parent.parent.parent / "Data" / "chroma_db"),
+    )
 
 # Collection names
 _COL_MARKET = "market_data"

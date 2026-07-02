@@ -40,6 +40,7 @@ from Bot.db import BotDB, create_db
 from Bot.llm_generator import LLMClient, MarketContext, QuestionGenerator, get_llm_client
 from Bot.RAG.retriever import RAGRetriever
 from Bot.RAG.evaluator import SAQEvaluator
+from Bot.RAG.ingest import run_full_ingestion
 from Bot.scoring import AnswerScorer, SessionScore
 from Bot.model.main import MLModel, extract_features
 from Bot.context_injector import ContextInjector
@@ -372,37 +373,49 @@ class FinnexusBot:
         question_generator: QuestionGenerator,
         saq_evaluator: SAQEvaluator,
         ml_model: MLModel,
+        retriever: Optional[RAGRetriever] = None,
     ):
         self._db = db
         self._qgen = question_generator
         self._evaluator = saq_evaluator
         self._ml = ml_model
-        self._context_injector = ContextInjector(db=db)
+        self._retriever = retriever or RAGRetriever()
+        self._context_injector = ContextInjector(db=db, retriever=self._retriever)
         self._scorer = AnswerScorer(llm_client=question_generator.llm)
 
-        # In-memory session cache  {user_id: BotSession}
         self._sessions: Dict[int, BotSession] = {}
-        # Question timing tracker {session_id: {question_id: start_time}}
         self._q_start_times: Dict[str, Dict[str, float]] = {}
-        # Timing results per session {session_id: {question_id: elapsed_secs}}
         self._q_timings: Dict[str, Dict[str, float]] = {}
+        self._progression_log: List[Dict[str, Any]] = []
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
     @classmethod
-    def from_env(cls) -> "FinnexusBot":
+    def from_env(cls, ensure_rag: bool = True) -> "FinnexusBot":
         """Build a fully wired FinnexusBot from environment / config defaults."""
         db = create_db(
             url=cfg.SUPABASE_URL,
             key=cfg.SUPABASE_KEY,
-            sqlite_path=str(cfg.MODEL_DIR.parent / "finnexus_dev.db"),
+            sqlite_path=str(cfg.SQLITE_PATH),
         )
         llm = get_llm_client()
         qgen = QuestionGenerator(llm_client=llm)
-        retriever = RAGRetriever()
+        retriever = RAGRetriever(persist_path=str(cfg.CHROMA_PERSIST_PATH))
+        if ensure_rag:
+            counts = retriever.stats().get("collection_counts", {})
+            if sum(v for v in counts.values() if isinstance(v, int) and v > 0) < 5:
+                logger.info("FinnexusBot: Chroma collections sparse — running ingestion")
+                run_full_ingestion(persist_path=str(cfg.CHROMA_PERSIST_PATH))
+                retriever = RAGRetriever(persist_path=str(cfg.CHROMA_PERSIST_PATH))
         evaluator = SAQEvaluator(retriever=retriever, llm_client=llm if llm.available else None)
         ml = MLModel(model_dir=cfg.MODEL_DIR)
-        return cls(db=db, question_generator=qgen, saq_evaluator=evaluator, ml_model=ml)
+        return cls(
+            db=db,
+            question_generator=qgen,
+            saq_evaluator=evaluator,
+            ml_model=ml,
+            retriever=retriever,
+        )
 
 
     # =========================================================================
@@ -446,6 +459,7 @@ class FinnexusBot:
             self._q_timings[session.session_id] = {}
 
             self._db.create_session(session.session_id, user_id, level)
+            self._db.increment_session_count(user_id)
             logger.info(
                 "async_start_session: new %s for user %d level %d (%d questions)",
                 session.session_id, user_id, level, len(questions),
@@ -555,6 +569,11 @@ class FinnexusBot:
         avg_score = session.average_score
         level_result = self._compute_level_result(user_id, session, avg_score)
 
+        if level_result.is_level_20:
+            self.process_level_20_final(user_id, session, level_result)
+
+        self._update_user_profile_after_level(user_id, level_result, avg_score)
+
         # Step 5: update DB + ML
         await update_user(
             db=self._db,
@@ -635,6 +654,7 @@ class FinnexusBot:
             self._q_timings[session.session_id] = {}
 
             self._db.create_session(session.session_id, user_id, level)
+            self._db.increment_session_count(user_id)
             logger.info(
                 "FinnexusBot: new session %s for user %d level %d (%d questions)",
                 session.session_id, user_id, level, len(questions),
@@ -773,6 +793,13 @@ class FinnexusBot:
             "FinnexusBot: HITL features for user %d: %s", user_id, hitl_feats
         )
 
+        level_result = self._compute_level_result(user_id, session, avg_score)
+
+        if level_result.is_level_20:
+            self.process_level_20_final(user_id, session, level_result)
+
+        self._update_user_profile_after_level(user_id, level_result, avg_score)
+
         # Step 5: DB + ML
         self._db.save_level_progress(
             user_id=user_id, level=level, score=avg_score,
@@ -809,19 +836,25 @@ class FinnexusBot:
         level = session.level
         is_level_20 = (level == 20)
 
-        base_reward = cfg.LEVEL_REWARDS.get(level, cfg.LEVEL_20_BASE_REWARD)
+        base_reward = cfg.level_base_reward(level)
         level_20_bonus = 0
         if is_level_20:
             level_20_bonus = int(avg_score * cfg.LEVEL_20_MAX_BONUS)
             reward = base_reward + level_20_bonus
         else:
-            reward = int(base_reward * avg_score)
+            reward = int(base_reward * max(avg_score, 0.1))
 
         level_up = avg_score >= cfg.LEVEL_UP_THRESHOLD
-        level_down = avg_score < cfg.LEVEL_DOWN_THRESHOLD and level > 1
+        level_down = (
+            avg_score < cfg.LEVEL_DOWN_THRESHOLD
+            and level > 1
+            and not is_level_20
+        )
 
-        if level_up and not is_level_20:
-            next_level = min(level + 1, 5)
+        if is_level_20:
+            next_level = cfg.LEVEL_20
+        elif level_up and level < cfg.MAX_LEVEL:
+            next_level = level + 1
         elif level_down:
             next_level = max(level - 1, 1)
         else:
@@ -834,7 +867,10 @@ class FinnexusBot:
         else:
             msg = f"Score {avg_score:.0%} — stay at Level {level}. Keep practising!"
         if is_level_20:
-            msg += f" Bonus earned: ${level_20_bonus}."
+            msg = (
+                f"Level 20 complete! Global macro score {avg_score:.0%}. "
+                f"Bonus earned: ${level_20_bonus}."
+            )
 
         return LevelResult(
             level=level, score=avg_score, reward=reward,
@@ -842,6 +878,151 @@ class FinnexusBot:
             is_level_20=is_level_20, level_20_bonus=level_20_bonus,
             message=msg,
         )
+
+    def process_level_20_final(
+        self,
+        user_id: int,
+        session: BotSession,
+        level_result: LevelResult,
+    ) -> Dict[str, Any]:
+        """
+        Final processing after Level 20 (global macro synthesis) completes.
+        Marks profile, logs progression, applies mastery bonus to paper cash.
+        """
+        profile = self._db.get_user_profile(user_id)
+        mastery_bonus = 0
+        if level_result.score >= cfg.LEVEL_UP_THRESHOLD and not profile.get("level_20_completed"):
+            mastery_bonus = cfg.LEVEL_20_MAX_BONUS // 2
+            self._db.add_paper_cash(user_id, mastery_bonus)
+
+        completed_at = datetime.now().isoformat()
+        self._db.save_user_profile(
+            user_id,
+            level_20_completed=1,
+            level_20_completed_at=completed_at,
+            current_level=cfg.LEVEL_20,
+            highest_level_completed=cfg.LEVEL_20,
+            proficiency=min(1.0, float(level_result.score)),
+        )
+
+        entry = {
+            "event": "level_20_final",
+            "user_id": user_id,
+            "session_id": session.session_id,
+            "score": round(level_result.score, 4),
+            "reward": level_result.reward,
+            "mastery_bonus": mastery_bonus,
+            "completed_at": completed_at,
+        }
+        self._progression_log.append(entry)
+        logger.info("FinnexusBot: Level 20 final for user %d — %s", user_id, entry)
+        return entry
+
+    def _update_user_profile_after_level(
+        self,
+        user_id: int,
+        level_result: LevelResult,
+        avg_score: float,
+    ) -> None:
+        """Persist level progression and proficiency after any level completion."""
+        profile = self._db.get_user_profile(user_id)
+        prev_highest = int(profile.get("highest_level_completed", 0) or 0)
+        prev_level = int(profile.get("current_level", 1) or 1)
+
+        if level_result.is_level_20:
+            new_current = cfg.LEVEL_20
+            new_highest = cfg.LEVEL_20
+        elif level_result.level_up:
+            new_current = max(prev_level, level_result.next_level)
+            new_highest = max(prev_highest, level_result.level)
+        elif level_result.next_level < prev_level:
+            new_current = level_result.next_level
+            new_highest = max(prev_highest, level_result.level)
+        else:
+            new_current = max(prev_level, level_result.level)
+            new_highest = max(prev_highest, level_result.level)
+
+        history = self._db.get_user_history(user_id, limit=50)
+        proficiency = min(1.0, avg_score * (1 + new_highest / cfg.MAX_LEVEL))
+
+        self._db.save_user_profile(
+            user_id,
+            current_level=new_current,
+            highest_level_completed=new_highest,
+            proficiency=round(proficiency, 4),
+        )
+
+        entry = {
+            "event": "level_complete",
+            "user_id": user_id,
+            "level": level_result.level,
+            "score": round(level_result.score, 4),
+            "reward": level_result.reward,
+            "next_level": level_result.next_level,
+            "level_up": level_result.level_up,
+            "paper_cash": self._db.get_paper_cash(user_id),
+            "current_level": new_current,
+            "highest_level_completed": new_highest,
+            "total_answers": len(history),
+        }
+        self._progression_log.append(entry)
+        logger.info("FinnexusBot: progression user %d — %s", user_id, entry)
+
+    def get_user_profile(self, user_id: int) -> Dict[str, Any]:
+        """Read user profile including paper cash and level state."""
+        profile = dict(self._db.get_user_profile(user_id))
+        profile["paper_cash"] = self._db.get_paper_cash(user_id)
+        profile["contribution_history"] = self._db.get_user_progress(user_id)
+        return profile
+
+    def update_user_profile(self, user_id: int, **fields: Any) -> Dict[str, Any]:
+        """Write user profile fields (name, email, current_level, etc.)."""
+        allowed = {"name", "email", "current_level", "proficiency"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return self.get_user_profile(user_id)
+        self._db.save_user_profile(user_id, **updates)
+        return self.get_user_profile(user_id)
+
+    def get_session_state(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Return in-memory + DB session snapshot for debugging/monitoring."""
+        session = self._get_session(user_id)
+        db_row = self._db.get_active_session(user_id)
+        if session is None and db_row is None:
+            return None
+        state: Dict[str, Any] = {
+            "user_id": user_id,
+            "profile": self.get_user_profile(user_id),
+            "progression_log": list(self._progression_log),
+        }
+        if session:
+            state["session"] = session.to_dict()
+            state["answered"] = len(session.answers)
+            state["current_question"] = (
+                session.current_question.to_dict() if session.current_question else None
+            )
+        if db_row:
+            state["db_session"] = db_row
+        return state
+
+    def get_progression_log(self) -> List[Dict[str, Any]]:
+        return list(self._progression_log)
+
+    def run_rag_ingestion(self) -> Dict[str, Any]:
+        """Populate Chroma collections from market CSVs and news API."""
+        stats = run_full_ingestion(persist_path=str(cfg.CHROMA_PERSIST_PATH))
+        self._retriever = RAGRetriever(persist_path=str(cfg.CHROMA_PERSIST_PATH))
+        self._context_injector = ContextInjector(db=self._db, retriever=self._retriever)
+        self._evaluator.retriever = self._retriever
+        return stats
+
+    def retrieve_context(self, query: str, collection: str = "trading_theories") -> Dict[str, Any]:
+        """Fetch RAG context for a query from the specified collection."""
+        if collection == "market_data":
+            return self._retriever.get_market_context(query)
+        if collection == "news_events":
+            return self._retriever.get_news_context(query)
+        return self._retriever.get_theory_context(query)
 
     def _score_answer(self, question: Any, answer: Any) -> Tuple[float, str]:
         """Return (score 0-1, feedback str). No side effects."""

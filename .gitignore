@@ -11,3 +11,5 @@ Notebooks/catboost_info
 __init__.py
 .env
 *.env
+STATUS.md
+state.md

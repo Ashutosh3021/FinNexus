@@ -150,6 +150,7 @@ export interface User {
   email: string
   avatar: string
   paperCash: number
+  currentLevel: number
   trackedAssets: string[]
   joinedAt: string
 }

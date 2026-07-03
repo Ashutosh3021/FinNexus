@@ -1,4 +1,4 @@
-﻿"""
+"""
 FinNexus Bot — HITL Question Generator  (v3 — Batched RAG-Driven Generation)
 =============================================================================
 Generates 19 questions per session that extract HUMAN TRADING INTELLECT:
@@ -330,6 +330,7 @@ def _slim_context_to_vars(slim: Dict) -> Dict[str, str]:
     regime   = mkt.get("regime", "neutral")
     trend    = mkt.get("trend", "flat")
     vix      = mkt.get("vix", 18.0)
+    dxy_trend = mkt.get("dxy_trend", "flat")
     level    = user.get("level", 1)
     weakness = user.get("weakness", "risk management")
 
@@ -346,6 +347,7 @@ def _slim_context_to_vars(slim: Dict) -> Dict[str, str]:
         "regime":       regime,
         "trend":        trend,
         "vix":          f"{vix:.1f}",
+        "dxy_trend":    dxy_trend,
         "level":        str(level),
         "weakness":     weakness,
         "top_headline": top_news,
@@ -374,7 +376,7 @@ def _build_batch_prompt(
     base = (
         f"You generate trading scenario questions. Be concise.\n"
         f"Context: {v['asset']} at {v['price']}, market: {v['regime']} (VIX {v['vix']}), "
-        f"trend: {v['trend']}\n"
+        f"trend: {v['trend']}, DXY: {v['dxy_trend']}\n"
         f"News: {v['top_headline']}\n"
         f"User level: {v['level']} ({level_desc}), target weakness: {v['weakness']}\n"
     )
@@ -686,6 +688,7 @@ def _market_context_to_slim(ctx: MarketContext) -> Dict:
             "price":  float(price),
             "trend":  trend,
             "vix":    float(ctx.vix_level),
+            "dxy_trend": ctx.dxy_trend,
         },
         "news":   news_items,
         "theory": [],

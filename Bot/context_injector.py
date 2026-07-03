@@ -64,7 +64,7 @@ def _fetch_live_market() -> Optional[Dict]:
         import yfinance as yf  # type: ignore
 
         raw = yf.download(
-            ["^VIX", "^GSPC", "BTC-USD", "^NSEI"],
+            ["^VIX", "^GSPC", "BTC-USD", "^NSEI", "DX-Y.NYB"],
             period="5d", interval="1d",
             progress=False, auto_adjust=True,
         )
@@ -76,10 +76,29 @@ def _fetch_live_market() -> Optional[Dict]:
             except Exception:
                 return 0.0
 
+        def _pct_change(sym: str, periods: int = 3) -> float:
+            try:
+                s = close[sym].dropna()
+                if len(s) < periods + 1:
+                    return 0.0
+                return float((s.iloc[-1] - s.iloc[-1 - periods]) / s.iloc[-1 - periods])
+            except Exception:
+                return 0.0
+
         vix = _last("^VIX") or 18.0
         spy = _last("^GSPC")
         btc = _last("BTC-USD")
         nifty = _last("^NSEI")
+        dxy = _last("DX-Y.NYB")
+
+        # Compute DXY trend from 3-day change
+        dxy_chg = _pct_change("DX-Y.NYB", 3)
+        if dxy_chg > 0.005:
+            dxy_trend = "rising"
+        elif dxy_chg < -0.005:
+            dxy_trend = "falling"
+        else:
+            dxy_trend = "flat"
 
         # Simple regime logic
         if vix > 30:
@@ -99,6 +118,7 @@ def _fetch_live_market() -> Optional[Dict]:
             "price":  price,
             "trend":  "above 50d MA" if regime == "bull" else "near 50d MA",
             "vix":    vix,
+            "dxy_trend": dxy_trend,
         }
     except Exception as exc:
         logger.debug("_fetch_live_market failed: %s", exc)
@@ -282,6 +302,7 @@ def _assemble_context(
                 "price":  0.0,
                 "trend":  "flat",
                 "vix":    18.0,
+                "dxy_trend": "flat",
             }
 
         # Enforce schema and types
@@ -291,6 +312,7 @@ def _assemble_context(
             "price":  float(market_block.get("price", 0.0)),
             "trend":  str(market_block.get("trend",  "flat")),
             "vix":    float(market_block.get("vix",   18.0)),
+            "dxy_trend": str(market_block.get("dxy_trend", "flat")),
         }
         news_block   = news_items[:3]
         theory_block = theory_items[:3]
@@ -393,7 +415,7 @@ class ContextInjector:
         return MarketContext(
             regime=mkt["regime"],
             vix_level=mkt["vix"],
-            dxy_trend="flat",               # not in slim format; use default
+            dxy_trend=mkt.get("dxy_trend", "flat"),   # propagated from live market data
             news=headlines,
             prices={mkt["asset"]: mkt["price"]} if mkt["price"] > 0 else {},
             trends={mkt["asset"]: mkt["trend"]} if mkt["trend"] else {},

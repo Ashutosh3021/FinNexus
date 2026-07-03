@@ -10,6 +10,7 @@ export const mockUser: User = {
   email: 'arjun@example.com',
   avatar: 'AS',
   paperCash: 100,
+  currentLevel: 1,
   trackedAssets: ['btc', 'eth', 'nifty50', 'gold'],
   joinedAt: '2026-01-15',
 }

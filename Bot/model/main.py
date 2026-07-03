@@ -151,8 +151,12 @@ class MLModel:
         self._scaler: Optional[Any] = None
         self._training_buffer: List[tuple] = []  # (X, y) pairs pending fit
         self._n_trained: int = 0
+        self._val_metrics: dict = {}
 
         self._load()
+        # Pre-train with synthetic data if no model exists yet
+        if self._model is None:
+            self._pretrain_synthetic()
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -178,6 +182,7 @@ class MLModel:
         if self._meta_path().exists():
             meta = json.loads(self._meta_path().read_text())
             self._n_trained = meta.get("n_trained", 0)
+            self._val_metrics = meta.get("val_metrics", {})
 
     def _save(self) -> None:
         if self._model:
@@ -186,7 +191,10 @@ class MLModel:
         if self._scaler:
             with open(self._scaler_path(), "wb") as f:
                 pickle.dump(self._scaler, f)
-        self._meta_path().write_text(json.dumps({"n_trained": self._n_trained}))
+        self._meta_path().write_text(json.dumps({
+            "n_trained": self._n_trained,
+            "val_metrics": self._val_metrics,
+        }))
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
@@ -240,13 +248,19 @@ class MLModel:
         X = np.array([x for x, _ in self._training_buffer], dtype=np.float32)
         y = np.array([y for _, y in self._training_buffer], dtype=np.float32)
 
+        # Train/validation split (80/20) for performance tracking
+        n_val = max(1, len(X) // 5)
+        X_train, X_val = X[:-n_val], X[-n_val:]
+        y_train, y_val = y[:-n_val], y[-n_val:]
+
         if _SKL_AVAILABLE:
+            from sklearn.preprocessing import StandardScaler
             if self._scaler is None:
-                from sklearn.preprocessing import StandardScaler
                 self._scaler = StandardScaler()
-                X = self._scaler.fit_transform(X)
-            else:
-                X = self._scaler.transform(X)
+            # Always re-fit scaler on the current buffer to capture distribution shifts
+            self._scaler.fit(X_train)
+            X_train = self._scaler.transform(X_train)
+            X_val = self._scaler.transform(X_val)
 
         if self._model is None:
             self._model = xgb.XGBRegressor(
@@ -258,10 +272,23 @@ class MLModel:
                 random_state=42,
                 verbosity=0,
             )
-            self._model.fit(X, y)
+            self._model.fit(X_train, y_train)
         else:
-            # Warm-start: update with new data
-            self._model.fit(X, y, xgb_model=self._model.get_booster())
+            # Warm-start: update with new data using all training samples
+            self._model.fit(X_train, y_train, xgb_model=self._model.get_booster())
+
+        # Validation metrics
+        if len(X_val) > 0:
+            val_preds = self._model.predict(X_val)
+            val_mae = float(np.mean(np.abs(val_preds - y_val)))
+            val_rmse = float(np.sqrt(np.mean((val_preds - y_val) ** 2)))
+            self._val_metrics = {"mae": round(val_mae, 4), "rmse": round(val_rmse, 4)}
+            logger.info(
+                "MLModel: validation MAE=%.4f RMSE=%.4f (%d val samples)",
+                val_mae, val_rmse, len(X_val),
+            )
+        else:
+            self._val_metrics = {}
 
         self._n_trained += len(self._training_buffer)
         self._training_buffer.clear()
@@ -278,4 +305,58 @@ class MLModel:
             "buffer_size": len(self._training_buffer),
             "feature_names": FEATURE_NAMES,
             "model_path": str(self._model_path()),
+            "val_metrics": self._val_metrics,
         }
+
+    # ── Synthetic pre-training ─────────────────────────────────────────────────
+
+    def _pretrain_synthetic(self) -> None:
+        """
+        Generate synthetic training data and train the initial XGBoost model.
+        Called once at startup when no pre-trained model exists in artifacts/.
+        Uses 80 samples (>50 threshold) so training triggers immediately.
+        """
+        if not _XGB_AVAILABLE:
+            logger.warning("MLModel: xgboost unavailable — cannot pre-train")
+            return
+
+        logger.info("MLModel: no pre-trained model found — generating synthetic training data...")
+        rng = np.random.default_rng(42)
+        n_samples = 80
+
+        # Generate plausible HITL feature vectors
+        X_list = []
+        y_list = []
+        for _ in range(n_samples):
+            avg_score = rng.uniform(0.1, 1.0)
+            mcq_acc = rng.uniform(max(0.0, avg_score - 0.3), min(1.0, avg_score + 0.3))
+            saq_avg = rng.uniform(max(0.0, avg_score - 0.25), min(1.0, avg_score + 0.25))
+            level_norm = rng.uniform(0.05, 1.0)
+            q_answered_norm = rng.uniform(0.1, 1.0)
+            variance = rng.uniform(0.0, 0.15)
+            top_score = min(1.0, avg_score + rng.uniform(0.0, 0.3))
+            bot_score = max(0.0, avg_score - rng.uniform(0.0, 0.3))
+            streak_norm = rng.uniform(0.0, q_answered_norm)
+            level_20_flag = float(rng.random() < 0.1)
+
+            feat = np.array([
+                avg_score, mcq_acc, saq_avg,
+                level_norm, q_answered_norm, variance,
+                top_score, bot_score, streak_norm, level_20_flag,
+            ], dtype=np.float32)
+
+            # Target: improvement correlated with scores, with noise
+            target = float(np.clip(
+                avg_score * 0.6 + mcq_acc * 0.2 + saq_avg * 0.2 + rng.normal(0, 0.05),
+                0.0, 1.0,
+            ))
+            X_list.append(feat)
+            y_list.append(target)
+
+        # Queue all samples in the buffer
+        for feat, target in zip(X_list, y_list):
+            self._training_buffer.append((feat, target))
+
+        # Fit (buffer ≥ 50 samples triggers the full fit + val split)
+        self._fit_buffer()
+        logger.info("MLModel: synthetic pre-training complete — model saved to %s", self._model_path())

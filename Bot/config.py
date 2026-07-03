@@ -29,16 +29,21 @@ LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "")
 
 # ── RAG / Chroma ──────────────────────────────────────────────────────────────
 CHROMA_PERSIST_PATH: Path = Path(
-    os.getenv("CHROMA_PERSIST_PATH", str(PROJECT_ROOT / "Data" / "chroma_db"))
+    os.getenv("CHROMA_PERSIST_PATH", "").strip()
+    or str(PROJECT_ROOT / "Data" / "chroma_db")
 )
 NEWSAPI_KEY: str = os.getenv("NEWSAPI_KEY", "")
 
 # ── ML Model ──────────────────────────────────────────────────────────────────
-MODEL_DIR: Path = Path(os.getenv("MODEL_DIR", str(Path(__file__).parent / "model" / "artifacts")))
+MODEL_DIR: Path = Path(
+    os.getenv("MODEL_DIR", "").strip()
+    or str(Path(__file__).parent / "model" / "artifacts")
+)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 SQLITE_PATH: Path = Path(
-    os.getenv("SQLITE_PATH", str(Path(__file__).parent / "model" / "finnexus_dev.db"))
+    os.getenv("SQLITE_PATH", "").strip()
+    or str(Path(__file__).parent / "model" / "finnexus_dev.db")
 )
 
 # ── Session ───────────────────────────────────────────────────────────────────

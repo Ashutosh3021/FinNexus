@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import pickle
 import re
 import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from Bot import config as cfg
@@ -46,6 +48,205 @@ from Bot.model.main import MLModel, extract_features
 from Bot.context_injector import ContextInjector
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Session store — Redis-backed with SQLite/in-memory fallback
+# ---------------------------------------------------------------------------
+
+class _SessionStore:
+    """
+    Persistent session store that survives process restarts.
+
+    Priority:
+      1. Redis (if REDIS_URL env var is set and redis-py is installed)
+      2. SQLite file (always available, persists across restarts)
+      3. In-memory dict (last resort — sessions lost on restart)
+    """
+
+    def __init__(self):
+        self._redis = None
+        self._sqlite_conn = None
+        self._memory: Dict[int, BotSession] = {}
+        self._init()
+
+    def _init(self) -> None:
+        redis_url = os.getenv("REDIS_URL", "")
+        if redis_url:
+            try:
+                import redis  # type: ignore
+                self._redis = redis.from_url(redis_url, decode_responses=False)
+                self._redis.ping()
+                logger.info("SessionStore: Redis connected at %s", redis_url)
+                return
+            except Exception as exc:
+                logger.warning("SessionStore: Redis init failed (%s) — falling back to SQLite", exc)
+
+        # SQLite file store
+        try:
+            import sqlite3
+            store_path = str(cfg.PROJECT_ROOT / "Data" / "session_store.db")
+            self._sqlite_conn = sqlite3.connect(store_path, check_same_thread=False)
+            self._sqlite_conn.row_factory = sqlite3.Row
+            self._sqlite_conn.execute(
+                """CREATE TABLE IF NOT EXISTS active_sessions (
+                    user_id INTEGER PRIMARY KEY,
+                    session_data BLOB NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+            self._sqlite_conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sess_updated ON active_sessions(updated_at)"
+            )
+            self._sqlite_conn.commit()
+            logger.info("SessionStore: SQLite file store at %s", store_path)
+        except Exception as exc:
+            logger.warning("SessionStore: SQLite init failed (%s) — using in-memory", exc)
+
+    def get(self, user_id: int) -> Optional[BotSession]:
+        """Retrieve a BotSession by user_id. Returns None if not found."""
+        # Check in-memory cache first
+        if user_id in self._memory:
+            return self._memory[user_id]
+
+        data = self._load_bytes(user_id)
+        if data is None:
+            return None
+        try:
+            session = pickle.loads(data)
+            self._memory[user_id] = session  # cache in memory
+            return session
+        except Exception as exc:
+            logger.warning("SessionStore: deserialise failed for user %d: %s", user_id, exc)
+            self._delete(user_id)
+            return None
+
+    def set(self, user_id: int, session: BotSession) -> None:
+        """Persist a BotSession for a user."""
+        self._memory[user_id] = session
+        try:
+            data = pickle.dumps(session)
+            self._save_bytes(user_id, data)
+        except Exception as exc:
+            logger.warning("SessionStore: persist failed for user %d: %s", user_id, exc)
+
+    def delete(self, user_id: int) -> None:
+        """Remove a session."""
+        self._memory.pop(user_id, None)
+        self._delete(user_id)
+
+    def recover_active_sessions(self) -> int:
+        """
+        On startup, re-hydrate all non-expired sessions from the persistent store
+        into the in-memory cache. Returns count recovered.
+        """
+        if self._redis is not None:
+            return 0  # Redis already persistent — no recovery needed
+
+        if self._sqlite_conn is None:
+            return 0
+
+        try:
+            timeout = cfg.SESSION_TIMEOUT_SECONDS
+            cutoff = (datetime.now() - timedelta(seconds=timeout)).isoformat()
+            rows = self._sqlite_conn.execute(
+                "SELECT user_id, session_data FROM active_sessions WHERE updated_at > ?",
+                (cutoff,),
+            ).fetchall()
+            count = 0
+            for row in rows:
+                try:
+                    session = pickle.loads(row["session_data"])
+                    age = (datetime.now() - session.last_activity).total_seconds()
+                    if age < timeout:
+                        self._memory[row["user_id"]] = session
+                        count += 1
+                except Exception:
+                    pass
+            if count:
+                logger.info("SessionStore: recovered %d active sessions from SQLite", count)
+            return count
+        except Exception as exc:
+            logger.warning("SessionStore: recovery failed: %s", exc)
+            return 0
+
+    def cleanup_expired(self) -> int:
+        """Remove expired sessions from persistent store. Returns count removed."""
+        timeout = cfg.SESSION_TIMEOUT_SECONDS
+        # In-memory cleanup
+        expired_users = [
+            uid for uid, sess in list(self._memory.items())
+            if (datetime.now() - sess.last_activity).total_seconds() > timeout
+        ]
+        for uid in expired_users:
+            self._memory.pop(uid, None)
+
+        if self._sqlite_conn is not None:
+            try:
+                cutoff = (datetime.now() - timedelta(seconds=timeout)).isoformat()
+                cur = self._sqlite_conn.execute(
+                    "DELETE FROM active_sessions WHERE updated_at <= ?", (cutoff,)
+                )
+                self._sqlite_conn.commit()
+                return cur.rowcount + len(expired_users)
+            except Exception:
+                pass
+        return len(expired_users)
+
+    # ── Internal backend helpers ───────────────────────────────────────────────
+
+    def _load_bytes(self, user_id: int) -> Optional[bytes]:
+        if self._redis is not None:
+            try:
+                return self._redis.get(f"finnexus:session:{user_id}")
+            except Exception:
+                pass
+        if self._sqlite_conn is not None:
+            try:
+                row = self._sqlite_conn.execute(
+                    "SELECT session_data FROM active_sessions WHERE user_id=?", (user_id,)
+                ).fetchone()
+                return bytes(row["session_data"]) if row else None
+            except Exception:
+                pass
+        return None
+
+    def _save_bytes(self, user_id: int, data: bytes) -> None:
+        if self._redis is not None:
+            try:
+                self._redis.setex(
+                    f"finnexus:session:{user_id}",
+                    cfg.SESSION_TIMEOUT_SECONDS,
+                    data,
+                )
+                return
+            except Exception as exc:
+                logger.warning("SessionStore: Redis save failed: %s", exc)
+        if self._sqlite_conn is not None:
+            try:
+                self._sqlite_conn.execute(
+                    "INSERT OR REPLACE INTO active_sessions(user_id, session_data, updated_at) "
+                    "VALUES (?, ?, ?)",
+                    (user_id, data, datetime.now().isoformat()),
+                )
+                self._sqlite_conn.commit()
+            except Exception as exc:
+                logger.warning("SessionStore: SQLite save failed: %s", exc)
+
+    def _delete(self, user_id: int) -> None:
+        if self._redis is not None:
+            try:
+                self._redis.delete(f"finnexus:session:{user_id}")
+            except Exception:
+                pass
+        if self._sqlite_conn is not None:
+            try:
+                self._sqlite_conn.execute(
+                    "DELETE FROM active_sessions WHERE user_id=?", (user_id,)
+                )
+                self._sqlite_conn.commit()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +584,11 @@ class FinnexusBot:
         self._context_injector = ContextInjector(db=db, retriever=self._retriever)
         self._scorer = AnswerScorer(llm_client=question_generator.llm)
 
-        self._sessions: Dict[int, BotSession] = {}
+        # Persistent session store (Redis → SQLite → memory)
+        self._session_store = _SessionStore()
+        self._session_store.recover_active_sessions()
+
+        # Timing dicts still held in memory (acceptable — they're transient)
         self._q_start_times: Dict[str, Dict[str, float]] = {}
         self._q_timings: Dict[str, Dict[str, float]] = {}
         self._progression_log: List[Dict[str, Any]] = []
@@ -435,7 +640,7 @@ class FinnexusBot:
         Exposed to Backend as POST /v2/session/start.
         """
         # Expire stale session
-        existing = self._sessions.get(user_id)
+        existing = self._session_store.get(user_id)
         if existing and not force_new:
             age = (datetime.now() - existing.last_activity).total_seconds()
             if age > cfg.SESSION_TIMEOUT_SECONDS:
@@ -454,7 +659,7 @@ class FinnexusBot:
             questions = await generate_questions(self._qgen, market_ctx, level, user_id)
 
             session = BotSession(user_id=user_id, level=level, questions=questions)
-            self._sessions[user_id] = session
+            self._session_store.set(user_id, session)
             self._q_start_times[session.session_id] = {}
             self._q_timings[session.session_id] = {}
 
@@ -536,6 +741,8 @@ class FinnexusBot:
                 feedback=feedback,
             )
 
+        # Persist updated session state
+        self._session_store.set(user_id, session)
         self._db.update_session(session.session_id, current_question=session.current_index)
 
         # Only finalise if all questions answered
@@ -591,7 +798,7 @@ class FinnexusBot:
         session.status = SessionStatus.COMPLETED
         self._db.close_session(session.session_id, status="completed")
         self._q_start_times.pop(session.session_id, None)
-        del self._sessions[user_id]
+        self._session_store.delete(user_id)
 
         logger.info(
             "async_submit_answers: user %d | level %d | score=%.3f | reward=%d",
@@ -625,7 +832,7 @@ class FinnexusBot:
         Runs the async pipeline synchronously via asyncio.
         """
         # Expire stale in-memory session
-        existing = self._sessions.get(user_id)
+        existing = self._session_store.get(user_id)
         if existing and not force_new:
             age = (datetime.now() - existing.last_activity).total_seconds()
             if age > cfg.SESSION_TIMEOUT_SECONDS:
@@ -649,7 +856,7 @@ class FinnexusBot:
             )
 
             session = BotSession(user_id=user_id, level=level, questions=questions)
-            self._sessions[user_id] = session
+            self._session_store.set(user_id, session)
             self._q_start_times[session.session_id] = {}
             self._q_timings[session.session_id] = {}
 
@@ -737,6 +944,8 @@ class FinnexusBot:
             is_level_20=is_level_20,
             feedback=feedback,
         )
+        # Persist session so it survives restarts
+        self._session_store.set(user_id, session)
         self._db.update_session(session.session_id, current_question=session.current_index)
 
         # Start timer for next question
@@ -821,7 +1030,7 @@ class FinnexusBot:
         session.status = SessionStatus.COMPLETED
         self._db.close_session(session.session_id, status="completed")
         self._q_start_times.pop(session.session_id, None)
-        del self._sessions[user_id]
+        self._session_store.delete(user_id)
 
         logger.info(
             "FinnexusBot: user %d finished level %d | score=%.3f | reward=%d | next=%d",
@@ -1070,9 +1279,10 @@ class FinnexusBot:
         return 0.0, "Unknown question type."
 
     def _find_session_by_id(self, session_id: str) -> Optional[BotSession]:
-        """Look up a session by session_id across all in-memory sessions."""
-        for session in self._sessions.values():
-            if session.session_id == session_id:
+        """Look up a session by session_id across all persisted sessions."""
+        for user_id in list(self._session_store._memory.keys()):
+            session = self._session_store.get(user_id)
+            if session and session.session_id == session_id:
                 age = (datetime.now() - session.last_activity).total_seconds()
                 if age > cfg.SESSION_TIMEOUT_SECONDS:
                     self._close_session(session.user_id, SessionStatus.TIMED_OUT)
@@ -1081,7 +1291,7 @@ class FinnexusBot:
         return None
 
     def _get_session(self, user_id: int) -> Optional[BotSession]:
-        session = self._sessions.get(user_id)
+        session = self._session_store.get(user_id)
         if session is None:
             return None
         age = (datetime.now() - session.last_activity).total_seconds()
@@ -1091,7 +1301,7 @@ class FinnexusBot:
         return session
 
     def _close_session(self, user_id: int, status: SessionStatus) -> None:
-        session = self._sessions.pop(user_id, None)
+        session = self._session_store.get(user_id)
         if session:
             self._db.close_session(session.session_id, status=status.value)
             self._q_start_times.pop(session.session_id, None)
@@ -1100,6 +1310,7 @@ class FinnexusBot:
                 "FinnexusBot: closed session %s with status %s",
                 session.session_id, status.value,
             )
+        self._session_store.delete(user_id)
 
 
     # =========================================================================
@@ -1142,7 +1353,7 @@ class FinnexusBot:
         return self._ml.get_stats()
 
     def predict_improvement(self, user_id: int) -> float:
-        session = self._sessions.get(user_id)
+        session = self._session_store.get(user_id)
         if session is None:
             return 0.0
         return self._ml.predict_improvement(session.answers, session.level)

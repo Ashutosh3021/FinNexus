@@ -33,19 +33,48 @@ _PROJECT_ROOT = cfg.PROJECT_ROOT
 _FEATURES_ROOT = _PROJECT_ROOT / "Data" / "Features"
 
 _MARKET_SAMPLES: List[Tuple[str, str, str]] = [
+    # Crypto — all 10 available
     ("Crypto", "BTC_features.csv", "BTC"),
     ("Crypto", "ETH_features.csv", "ETH"),
     ("Crypto", "SOL_features.csv", "SOL"),
+    ("Crypto", "BNB_features.csv", "BNB"),
+    ("Crypto", "LTC_features.csv", "LTC"),
+    ("Crypto", "XMR_features.csv", "XMR"),
+    ("Crypto", "TRX_features.csv", "TRX"),
+    ("Crypto", "UNI_features.csv", "UNI"),
+    ("Crypto", "TAO_features.csv", "TAO"),
+    ("Crypto", "WLD_features.csv", "WLD"),
+    # ETFs — key selections from 15 available
     ("ETFs", "SPY_features.csv", "SPY"),
     ("ETFs", "QQQ_features.csv", "QQQ"),
     ("ETFs", "GLD_features.csv", "GLD"),
+    ("ETFs", "IVV_features.csv", "IVV"),
+    ("ETFs", "EEM_features.csv", "EEM"),
+    ("ETFs", "TLT_features.csv", "TLT"),
+    ("ETFs", "XLE_features.csv", "XLE"),
+    ("ETFs", "IBIT_features.csv", "IBIT"),
+    # Commodities — all 14 available
     ("Commodities", "Gold_features.csv", "GOLD"),
     ("Commodities", "WTI_Crude_Oil_features.csv", "WTI"),
+    ("Commodities", "Silver_features.csv", "SILVER"),
+    ("Commodities", "Copper_features.csv", "COPPER"),
+    ("Commodities", "Natural_Gas_features.csv", "NATGAS"),
+    ("Commodities", "Brent_Crude_Oil_features.csv", "BRENT"),
+    ("Commodities", "Wheat_features.csv", "WHEAT"),
+    ("Commodities", "Aluminum_features.csv", "ALUM"),
+    ("Commodities", "Platinum_features.csv", "PLATINUM"),
+    ("Commodities", "Corn_features.csv", "CORN"),
+    ("Commodities", "Cotton_features.csv", "COTTON"),
+    ("Commodities", "Lead_features.csv", "LEAD"),
+    ("Commodities", "Natural_Rubber_features.csv", "RUBBER"),
+    ("Commodities", "Fertilizer_Index_features.csv", "FERTILIZER"),
+    # Futures — all available
     ("Futures", "NIFTY_50_Futures_features.csv", "NIFTY"),
     ("Futures", "BANK_NIFTY_Futures_features.csv", "BANKNIFTY"),
-    ("Stocks", "N50_RELIANCE_features.csv", "RELIANCE"),
-    ("Stocks", "N50_HDFCBANK_features.csv", "HDFCBANK"),
-    ("Stocks", "N50_TCS_features.csv", "TCS"),
+    ("Futures", "RELIANCE_Futures_features.csv", "RELIANCE"),
+    ("Futures", "HDFC_BANK_Futures_features.csv", "HDFCBANK"),
+    ("Futures", "INFOSYS_Futures_features.csv", "INFY"),
+    ("Futures", "FINNIFTY_Futures_features.csv", "FINNIFTY"),
 ]
 
 _NEWS_QUERIES: List[Tuple[str, List[str]]] = [
@@ -223,6 +252,16 @@ def _ingest_static_news(retriever: RAGRetriever) -> int:
     return len(static)
 
 
+def validate_collections(retriever: RAGRetriever) -> Dict[str, bool]:
+    """Check that each ChromaDB collection has at least 1 document."""
+    stats = retriever.stats()
+    counts = stats.get("collection_counts", {})
+    return {
+        name: (counts.get(name, 0) > 0)
+        for name in ("market_data", "news_events", "trading_theories")
+    }
+
+
 def run_full_ingestion(
     persist_path: Optional[str] = None,
     skip_news: bool = False,
@@ -230,6 +269,7 @@ def run_full_ingestion(
 ) -> Dict:
     """
     Run complete RAG ingestion. Returns stats dict.
+    Validates collections after ingestion and seeds static fallbacks if empty.
     """
     path = persist_path or str(cfg.CHROMA_PERSIST_PATH)
     retriever = RAGRetriever(persist_path=path)
@@ -237,15 +277,68 @@ def run_full_ingestion(
     market_n = 0 if skip_market else ingest_market_snapshots(retriever)
     news_n = 0 if skip_news else ingest_news_from_api(retriever)
 
+    # Validate — seed static fallbacks if collections are still empty
+    validation = validate_collections(retriever)
+    if not validation.get("market_data") and not skip_market:
+        logger.warning("ingest: market_data still empty after ingestion — seeding static fallback")
+        market_n += _ingest_static_market(retriever)
+
+    if not validation.get("news_events") and not skip_news:
+        logger.warning("ingest: news_events still empty — seeding static fallback")
+        news_n += _ingest_static_news(retriever)
+
     stats = retriever.stats()
     stats["ingested_market"] = market_n
     stats["ingested_news"] = news_n
     stats["ingested_at"] = datetime.now(timezone.utc).isoformat()
+    stats["validation"] = validate_collections(retriever)
     logger.info(
         "RAG ingestion complete: market=%d news=%d collections=%s",
         market_n, news_n, stats.get("collection_counts"),
     )
     return stats
+
+
+def _ingest_static_market(retriever: RAGRetriever) -> int:
+    """Fallback: seed a broad set of static market snapshots."""
+    static = [
+        ("BTC",        "Crypto",      67000.0, "neutral", "above 50d MA",  18.0),
+        ("ETH",        "Crypto",       3500.0, "neutral", "near key MAs",   18.0),
+        ("SOL",        "Crypto",        175.0, "bull",    "above 50d MA",   16.0),
+        ("BNB",        "Crypto",        420.0, "neutral", "near key MAs",   18.0),
+        ("SPY",        "ETFs",          505.0, "bull",    "above 50d MA",   14.0),
+        ("QQQ",        "ETFs",          430.0, "bull",    "above 50d MA",   14.0),
+        ("GLD",        "ETFs",          220.0, "neutral", "above 200d MA",  15.0),
+        ("TLT",        "ETFs",           95.0, "bear",    "below 50d MA",   16.0),
+        ("EEM",        "ETFs",           40.0, "neutral", "near key MAs",   18.0),
+        ("GOLD",       "Commodities",  2300.0, "neutral", "above 200d MA",  16.0),
+        ("WTI",        "Commodities",    76.0, "neutral", "near key MAs",   18.0),
+        ("SILVER",     "Commodities",    26.0, "neutral", "near key MAs",   17.0),
+        ("COPPER",     "Commodities",    3.85, "neutral", "near key MAs",   18.0),
+        ("NATGAS",     "Commodities",    2.40, "bear",    "below 50d MA",   20.0),
+        ("BRENT",      "Commodities",    80.0, "neutral", "near key MAs",   18.0),
+        ("WHEAT",      "Commodities",   650.0, "neutral", "near key MAs",   17.0),
+        ("NIFTY",      "Futures",     24000.0, "bull",    "above 50d MA",   15.0),
+        ("BANKNIFTY",  "Futures",     48000.0, "neutral", "near key MAs",   16.0),
+        ("RELIANCE",   "Futures",      2800.0, "neutral", "above 50d MA",   15.0),
+        ("HDFCBANK",   "Futures",      1700.0, "neutral", "near key MAs",   16.0),
+        ("INFY",       "Futures",      1850.0, "neutral", "near key MAs",   16.0),
+    ]
+    for symbol, asset_class, price, regime, trend, vix in static:
+        text = (
+            f"{symbol} ({asset_class}) snapshot static: "
+            f"close={price:,.2f}, regime={regime}, trend={trend}, vix={vix}."
+        )
+        retriever.upsert_market(
+            doc_id=f"static_market_{symbol.lower()}",
+            text=text,
+            regime=regime,
+            asset=symbol,
+            price=price,
+            trend=trend,
+            vix=vix,
+        )
+    return len(static)
 
 
 def main() -> None:

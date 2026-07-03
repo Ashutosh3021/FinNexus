@@ -42,7 +42,7 @@ const SELF_CHECK = [
 type View = 'gate' | 'questions' | 'history'
 
 export function ContributePage() {
-  const { hitlProgress, hitlQuestions, submitAnswer } = useAppStore()
+  const { hitlProgress, hitlQuestions, submitAnswer, advanceLevel } = useAppStore()
   const [view, setView] = useState<View>('gate')
   const [activeQuestion, setActiveQuestion] = useState<HITLQuestion | null>(null)
   const [selectedAnswer, setSelectedAnswer] = useState<string>('')
@@ -290,11 +290,7 @@ export function ContributePage() {
                   </p>
                 </div>
                 <button
-                  onClick={() => {
-                    // Advance level via store if you have an advanceLevel action,
-                    // otherwise the store should auto-advance when all questions answered.
-                    // This button is a visual cue — the level card will update reactively.
-                  }}
+                  onClick={() => advanceLevel()}
                   className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-primary text-on-primary font-headline font-semibold text-xs hover:brightness-110 transition-all active:scale-95 shrink-0"
                 >
                   Next Level <ArrowRight size={12} />

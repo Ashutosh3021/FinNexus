@@ -62,6 +62,20 @@ chromadb>=0.4.22
 sentence-transformers>=2.2.0
 httpx>=0.24.0
 
-# ── Optional Async Utilities (uncomment if needed) ──────────
+# ── Authentication & Security ────────────────────────────────────────────────
+PyJWT>=2.8.0
+slowapi>=0.1.9
+
+# ── Database (Supabase production) ───────────────────────────────────────────
+supabase>=2.3.0
+
+# ── Session store (Redis optional — SQLite used if not configured) ───────────
+redis>=5.0.0
+
+# ── Optional LLM provider SDKs ───────────────────────────────────────────────
+# anthropic>=0.25.0
+# cohere>=5.0.0
+
+# ── Optional Async Utilities ─────────────────────────────────────────────────
 # aiohttp>=3.8.0
 # orjson>=3.8.0

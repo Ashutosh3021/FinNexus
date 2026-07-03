@@ -13,9 +13,15 @@ interface SignalCardProps {
   trend: 'Bullish' | 'Neutral' | 'Bearish'
   volume: string
   className?: string
+  /** Called when the user clicks the Analyze button. */
+  onAnalyze?: (symbol: string) => void
 }
 
-const SignalCard = ({ symbol, name, price, change, confidence, variant = 'invest', trend, volume, className }: SignalCardProps) => {
+const SignalCard = ({
+  symbol, name, price, change, confidence,
+  variant = 'invest', trend, volume,
+  className, onAnalyze,
+}: SignalCardProps) => {
   const isPositive = !change.startsWith('-')
 
   return (
@@ -32,9 +38,9 @@ const SignalCard = ({ symbol, name, price, change, confidence, variant = 'invest
         </div>
         <div className={cn(
           "px-2.5 py-1 rounded font-headline text-xs font-bold tracking-wide border",
-          variant === 'invest' ? "bg-primary/10 text-primary border-primary/20" : 
-          variant === 'hold' ? "bg-tertiary/10 text-tertiary border-tertiary/20" : 
-          "bg-error/10 text-error border-error/20"
+          variant === 'invest' ? "bg-primary/10 text-primary border-primary/20" :
+          variant === 'hold'   ? "bg-tertiary/10 text-tertiary border-tertiary/20" :
+                                 "bg-error/10 text-error border-error/20"
         )}>
           {variant.toUpperCase()}
         </div>
@@ -48,7 +54,7 @@ const SignalCard = ({ symbol, name, price, change, confidence, variant = 'invest
           </div>
           <ConfidenceRing value={confidence} variant={variant} size="sm" />
         </div>
-        
+
         <div className="flex justify-between items-center">
           <div className="text-sm font-data text-on-surface-variant">Vol: {volume}</div>
           <div className={cn(
@@ -63,12 +69,20 @@ const SignalCard = ({ symbol, name, price, change, confidence, variant = 'invest
 
       <CardFooter className="flex justify-between items-center">
         <span className="text-sm text-on-surface-variant font-body">
-          Trend: <span className={cn(
+          Trend:{' '}
+          <span className={cn(
             "font-medium",
-            trend === 'Bullish' ? "text-primary" : trend === 'Neutral' ? "text-tertiary" : "text-error"
-          )}>{trend}</span>
+            trend === 'Bullish' ? "text-primary" :
+            trend === 'Neutral' ? "text-tertiary" : "text-error"
+          )}>
+            {trend}
+          </span>
         </span>
-        <button className="text-xs font-headline font-semibold text-primary hover:text-primary-container transition-colors flex items-center gap-1">
+        <button
+          onClick={() => onAnalyze?.(symbol)}
+          className="text-xs font-headline font-semibold text-primary hover:text-primary-container transition-colors flex items-center gap-1 active:scale-95"
+          aria-label={`Analyze ${symbol}`}
+        >
           Analyze <Activity size={14} />
         </button>
       </CardFooter>

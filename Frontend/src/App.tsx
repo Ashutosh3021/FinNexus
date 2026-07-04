@@ -10,6 +10,7 @@ import { ConfidencePage } from './pages/ConfidencePage'
 import { PaperTradingPage } from './pages/PaperTradingPage'
 import { NewsPage } from './pages/NewsPage'
 import { ContributePage } from './pages/ContributePage'
+import { ToastContainer } from './components/ui/ToastContainer'
 
 // Protected route wrapper
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -43,6 +44,8 @@ function App() {
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+      {/* Global toast notifications — outside router so they survive transitions */}
+      <ToastContainer />
     </BrowserRouter>
   )
 }

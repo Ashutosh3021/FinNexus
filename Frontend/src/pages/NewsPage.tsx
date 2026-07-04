@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { cn } from '../lib/utils'
 import { ExternalLink, Clock, Radio } from 'lucide-react'
@@ -18,7 +19,12 @@ const SENTIMENT_COLORS = {
 }
 
 export function NewsPage() {
-  const { news, newsFilter, setNewsFilter } = useAppStore()
+  const { news, newsFilter, setNewsFilter, fetchNews } = useAppStore()
+
+  // Fetch news on mount
+  useEffect(() => {
+    fetchNews()
+  }, [fetchNews])
 
   const filtered = newsFilter === 'All'
     ? news

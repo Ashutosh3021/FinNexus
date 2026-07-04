@@ -1,10 +1,10 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import { cn } from '../lib/utils'
 import {
   Trophy, Zap, CheckCircle2, XCircle, ChevronRight,
   BookOpen, Star, Coins, History, ShieldCheck, ArrowRight,
-  Lock, AlertTriangle, ChevronLeft,
+  Lock, AlertTriangle, ChevronLeft, Loader2,
 } from 'lucide-react'
 import type { HITLQuestion } from '../types'
 
@@ -42,13 +42,21 @@ const SELF_CHECK = [
 type View = 'gate' | 'questions' | 'history'
 
 export function ContributePage() {
-  const { hitlProgress, hitlQuestions, submitAnswer, advanceLevel } = useAppStore()
+  const { hitlProgress, hitlQuestions, submitAnswer, advanceLevel, fetchHITLSession } = useAppStore()
   const [view, setView] = useState<View>('gate')
   const [activeQuestion, setActiveQuestion] = useState<HITLQuestion | null>(null)
   const [selectedAnswer, setSelectedAnswer] = useState<string>('')
   const [saAnswer, setSaAnswer] = useState<string>('')
   const [submitted, setSubmitted] = useState(false)
   const [wasCorrect, setWasCorrect] = useState<boolean | null>(null)
+  const [isAdvancing, setIsAdvancing] = useState(false)
+
+  // Fetch real questions when landing on the questions view
+  useEffect(() => {
+    if (view === 'questions') {
+      fetchHITLSession(hitlProgress.currentLevel)
+    }
+  }, [view, hitlProgress.currentLevel, fetchHITLSession])
 
   const answeredIds = new Set(hitlProgress.history.map(h => h.questionId))
 
@@ -290,10 +298,19 @@ export function ContributePage() {
                   </p>
                 </div>
                 <button
-                  onClick={() => advanceLevel()}
-                  className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-primary text-on-primary font-headline font-semibold text-xs hover:brightness-110 transition-all active:scale-95 shrink-0"
+                  onClick={async () => {
+                    setIsAdvancing(true)
+                    await advanceLevel()
+                    setIsAdvancing(false)
+                  }}
+                  disabled={isAdvancing}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-primary text-on-primary font-headline font-semibold text-xs hover:brightness-110 transition-all active:scale-95 shrink-0 disabled:opacity-60 disabled:cursor-wait"
                 >
-                  Next Level <ArrowRight size={12} />
+                  {isAdvancing ? (
+                    <><Loader2 size={12} className="animate-spin" /> Advancing…</>
+                  ) : (
+                    <>Next Level <ArrowRight size={12} /></>
+                  )}
                 </button>
               </div>
             )}

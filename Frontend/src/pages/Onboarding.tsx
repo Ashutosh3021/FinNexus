@@ -8,6 +8,7 @@ import {
 import { Button } from '../components/ui/Button'
 import { cn } from '../lib/utils'
 import { useAppStore } from '../store/useAppStore'
+import * as api from '../lib/api'
 import type { AssetClass } from '../types'
 
 const STEPS = ['Assets', 'Markets', 'Experience', 'Goals', 'Review', 'Launch']
@@ -45,10 +46,12 @@ function ReviewRow({ label, value, highlight = false }: { label: string; value: 
 export function Onboarding() {
   const navigate = useNavigate()
   const user = useAppStore((s) => s.user)
+  const fetchHITLSession = useAppStore((s) => s.fetchHITLSession)
   const [step, setStep] = useState(0)
   const [selectedAssets, setSelectedAssets] = useState<string[]>(['btc', 'eth'])
   const [selectedClasses, setSelectedClasses] = useState<AssetClass[]>(['Crypto'])
   const [experience, setExperience] = useState('beginner')
+  const [isLaunching, setIsLaunching] = useState(false)
 
   const toggleAsset = (id: string) =>
     setSelectedAssets(prev =>
@@ -223,8 +226,36 @@ export function Onboarding() {
               Continue <ArrowRight size={15} />
             </Button>
           ) : (
-            <Button className="gap-2 px-8" onClick={() => navigate('/app/prices')}>
-              Launch Dashboard <ArrowRight size={15} />
+            <Button
+              className="gap-2 px-8"
+              disabled={isLaunching}
+              onClick={async () => {
+                setIsLaunching(true)
+                try {
+                  // Map experience to proficiency score for /assess endpoint
+                  const proficiencyMap: Record<string, number> = {
+                    beginner:     0.1,
+                    intermediate: 0.4,
+                    advanced:     0.7,
+                  }
+                  const proficiency = proficiencyMap[experience] ?? 0.1
+                  const numericId = parseInt(
+                    (user?.id ?? '1').replace(/\D/g, ''),
+                    10,
+                  ) || 1
+
+                  // Call /assess to get recommended starting level
+                  await api.assessStartingLevel(numericId, proficiency).catch(() => null)
+
+                  // Pre-fetch first HITL session questions
+                  await fetchHITLSession(1).catch(() => null)
+                } finally {
+                  setIsLaunching(false)
+                  navigate('/app/prices')
+                }
+              }}
+            >
+              {isLaunching ? 'Launching…' : 'Launch Dashboard'} <ArrowRight size={15} />
             </Button>
           )}
         </footer>

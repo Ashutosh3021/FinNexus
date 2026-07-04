@@ -20,7 +20,9 @@ from __future__ import annotations
 import logging
 import os
 import time
+import glob
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, status
@@ -30,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from Bot.main import FinnexusBot
 from Bot.llm_generator import MarketContext
+import Bot.config as cfg
 
 logging.basicConfig(level="INFO", format="%(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("finnexus.api")
@@ -413,6 +416,302 @@ async def submit_answers_v2(
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         logger.error("submit_answers_v2 error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Market Data endpoints (public — no auth required) ──────────────────────────
+# Reads from Data/Cleaned CSVs so the frontend gets real historical price data.
+# Falls back gracefully to empty lists when CSV files are missing.
+
+_DATA_ROOT = cfg.PROJECT_ROOT / "Data" / "Cleaned"
+
+# ── Asset catalogue ─────────────────────────────────────────────────────────────
+# Maps each frontend asset id → (csv_relative_path, display_name, asset_class)
+_ASSET_CATALOGUE: Dict[str, Dict[str, str]] = {
+    # Crypto
+    "btc":       {"csv": "Crypto/BTC_cleaned.csv",               "name": "Bitcoin",                  "class": "Crypto",      "symbol": "BTC"},
+    "eth":       {"csv": "Crypto/ETH_cleaned.csv",               "name": "Ethereum",                 "class": "Crypto",      "symbol": "ETH"},
+    "sol":       {"csv": "Crypto/SOL_cleaned.csv",               "name": "Solana",                   "class": "Crypto",      "symbol": "SOL"},
+    "bnb":       {"csv": "Crypto/BNB_cleaned.csv",               "name": "BNB",                      "class": "Crypto",      "symbol": "BNB"},
+    "ltc":       {"csv": "Crypto/LTC_cleaned.csv",               "name": "Litecoin",                 "class": "Crypto",      "symbol": "LTC"},
+    "trx":       {"csv": "Crypto/TRX_cleaned.csv",               "name": "TRON",                     "class": "Crypto",      "symbol": "TRX"},
+    "xmr":       {"csv": "Crypto/XMR_cleaned.csv",               "name": "Monero",                   "class": "Crypto",      "symbol": "XMR"},
+    # Commodities
+    "gold":      {"csv": "Commodities/Gold_cleaned.csv",         "name": "Gold",                     "class": "Commodities", "symbol": "GOLD"},
+    "silver":    {"csv": "Commodities/Silver_cleaned.csv",       "name": "Silver",                   "class": "Commodities", "symbol": "SILVER"},
+    "crude":     {"csv": "Commodities/Brent_Crude_Oil_cleaned.csv", "name": "Brent Crude Oil",       "class": "Commodities", "symbol": "CRUDE"},
+    "wti":       {"csv": "Commodities/WTI_Crude_Oil_cleaned.csv","name": "WTI Crude Oil",            "class": "Commodities", "symbol": "WTI"},
+    "natgas":    {"csv": "Commodities/Natural_Gas_cleaned.csv",  "name": "Natural Gas",              "class": "Commodities", "symbol": "NATGAS"},
+    "copper":    {"csv": "Commodities/Copper_cleaned.csv",       "name": "Copper",                   "class": "Commodities", "symbol": "COPPER"},
+    "aluminum":  {"csv": "Commodities/Aluminum_cleaned.csv",     "name": "Aluminum",                 "class": "Commodities", "symbol": "ALU"},
+    "wheat":     {"csv": "Commodities/Wheat_cleaned.csv",        "name": "Wheat",                    "class": "Commodities", "symbol": "WHEAT"},
+    "corn":      {"csv": "Commodities/Corn_cleaned.csv",         "name": "Corn",                     "class": "Commodities", "symbol": "CORN"},
+}
+
+
+def _read_csv_tail(csv_path: Path, rows: int = 30) -> List[Dict]:
+    """Read last `rows` rows from a cleaned CSV. Returns list of dicts."""
+    try:
+        import pandas as pd  # type: ignore
+        df = pd.read_csv(csv_path)
+        # Only keep clean data
+        if "data_quality" in df.columns:
+            df = df[df["data_quality"] == 1]
+        df = df.dropna(subset=["Close"]).tail(rows)
+        return df.to_dict(orient="records")
+    except Exception as exc:
+        logger.debug("_read_csv_tail failed for %s: %s", csv_path, exc)
+        return []
+
+
+def _compute_trend(rows: List[Dict]) -> str:
+    """Classify last-N-row price movement as Bullish / Bearish / Neutral."""
+    if len(rows) < 2:
+        return "Neutral"
+    closes = [float(r.get("Close", r.get("close", 0)) or 0) for r in rows if r.get("Close") or r.get("close")]
+    if len(closes) < 2:
+        return "Neutral"
+    change = (closes[-1] - closes[0]) / closes[0] if closes[0] else 0
+    if change > 0.01:
+        return "Bullish"
+    if change < -0.01:
+        return "Bearish"
+    return "Neutral"
+
+
+def _build_price_entry(asset_id: str, meta: Dict, rows: List[Dict]) -> Optional[Dict]:
+    """Build a price dict from CSV rows for one asset."""
+    if not rows:
+        return None
+    last  = rows[-1]
+    close = float(last.get("Close", last.get("close", 0)) or 0)
+    if close <= 0:
+        return None
+
+    prev_close = float(rows[-2].get("Close", rows[-2].get("close", close)) or close) if len(rows) > 1 else close
+    change_pct = ((close - prev_close) / prev_close * 100) if prev_close else 0.0
+
+    volume_raw = last.get("Volume", last.get("volume", 0)) or 0
+    try:
+        volume_val = float(volume_raw)
+        volume_str = (f"${volume_val / 1e9:.1f}B" if volume_val > 1e9
+                      else f"${volume_val / 1e6:.0f}M" if volume_val > 1e6
+                      else str(volume_val))
+    except (ValueError, TypeError):
+        volume_str = str(volume_raw)
+
+    date_raw = last.get("Date", last.get("date", ""))
+    try:
+        last_updated = str(datetime.strptime(str(date_raw).split(" ")[0], "%Y-%m-%d").date())
+    except ValueError:
+        last_updated = str(date_raw)
+
+    trend = _compute_trend(rows[-7:])
+
+    return {
+        "id":           asset_id,
+        "symbol":       meta["symbol"],
+        "name":         meta["name"],
+        "price":        round(close, 2),
+        "change_percent": round(change_pct, 2),
+        "volume":       volume_str,
+        "last_updated": last_updated,
+        "trend":        trend,
+        "asset_class":  meta["class"],
+    }
+
+
+@app.get("/market/prices", tags=["Market"])
+def market_prices() -> Dict:
+    """
+    Return the latest price snapshot for all tracked assets.
+    Reads from Data/Cleaned CSVs — no auth required.
+    """
+    result = []
+    for asset_id, meta in _ASSET_CATALOGUE.items():
+        csv_path = _DATA_ROOT / meta["csv"]
+        rows = _read_csv_tail(csv_path, rows=8)
+        entry = _build_price_entry(asset_id, meta, rows)
+        if entry:
+            result.append(entry)
+    return {"prices": result, "count": len(result), "updated_at": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/market/trends", tags=["Market"])
+def market_trends(
+    timeframe: str = Query("1D", description="1D | 1W | 1M"),
+    asset_class: Optional[str] = Query(None, description="Filter by asset class"),
+) -> Dict:
+    """
+    Return trend signals per timeframe for all (or filtered) assets.
+    Trend is computed from CSV history over the appropriate lookback window.
+    """
+    lookback = {"1D": 2, "1W": 7, "1M": 30}.get(timeframe, 2)
+    result = []
+
+    for asset_id, meta in _ASSET_CATALOGUE.items():
+        if asset_class and asset_class.lower() not in meta["class"].lower():
+            continue
+        csv_path = _DATA_ROOT / meta["csv"]
+        rows_1d  = _read_csv_tail(csv_path, rows=2)
+        rows_1w  = _read_csv_tail(csv_path, rows=7)
+        rows_1m  = _read_csv_tail(csv_path, rows=30)
+        if not rows_1d:
+            continue
+        result.append({
+            "id":         asset_id,
+            "symbol":     meta["symbol"],
+            "name":       meta["name"],
+            "asset_class": meta["class"],
+            "trend_1d":   _compute_trend(rows_1d),
+            "trend_1w":   _compute_trend(rows_1w),
+            "trend_1m":   _compute_trend(rows_1m),
+        })
+
+    return {"trends": result, "timeframe": timeframe, "count": len(result)}
+
+
+# ── News endpoint ──────────────────────────────────────────────────────────────
+# Fetches from NewsAPI if NEWSAPI_KEY is configured, otherwise returns curated
+# static headlines derived from the RAG news_events collection.
+
+@app.get("/market/news", tags=["Market"])
+def market_news(
+    limit: int = Query(20, ge=1, le=100),
+    filter: Optional[str] = Query(None, description="Asset class filter"),
+) -> Dict:
+    """
+    Return market-moving news.
+    Uses NewsAPI (if key is set) or falls back to RAG news context.
+    No auth required.
+    """
+    newsapi_key = os.getenv("NEWSAPI_KEY", "").strip()
+    news_items: List[Dict] = []
+
+    # ── Live NewsAPI ────────────────────────────────────────────────────────────
+    if newsapi_key:
+        try:
+            import requests as _requests  # type: ignore
+            queries = ["stock market", "cryptocurrency", "commodities", "federal reserve", "india nifty"]
+            seen_titles: set = set()
+            for q in queries:
+                if len(news_items) >= limit:
+                    break
+                resp = _requests.get(
+                    "https://newsapi.org/v2/everything",
+                    params={
+                        "q":        q,
+                        "apiKey":   newsapi_key,
+                        "language": "en",
+                        "sortBy":   "publishedAt",
+                        "pageSize": 5,
+                    },
+                    timeout=5,
+                )
+                if resp.status_code != 200:
+                    continue
+                for article in resp.json().get("articles", []):
+                    title = article.get("title", "") or ""
+                    if not title or title in seen_titles:
+                        continue
+                    seen_titles.add(title)
+                    # Derive sentiment & impact heuristically
+                    lower_title = title.lower()
+                    positive_words = {"rise", "surge", "gain", "high", "beat", "record", "rally", "up", "positive", "buy"}
+                    negative_words = {"fall", "drop", "loss", "low", "miss", "crash", "sell", "cut", "down", "negative", "warn"}
+                    pos_hits = sum(1 for w in positive_words if w in lower_title)
+                    neg_hits = sum(1 for w in negative_words if w in lower_title)
+                    sentiment = "positive" if pos_hits > neg_hits else "negative" if neg_hits > pos_hits else "neutral"
+                    impact = "high" if any(w in lower_title for w in {"federal", "rate", "war", "crash", "ban"}) else "medium"
+
+                    # Determine affected classes
+                    affected_classes: List[str] = []
+                    if any(w in lower_title for w in {"bitcoin", "crypto", "eth", "btc", "solana"}):
+                        affected_classes.append("Crypto")
+                    if any(w in lower_title for w in {"stock", "nifty", "sensex", "equity", "share", "nasdaq", "s&p"}):
+                        affected_classes.append("Stocks")
+                    if any(w in lower_title for w in {"gold", "silver", "oil", "crude", "wheat", "commodity"}):
+                        affected_classes.append("Commodities")
+                    if any(w in lower_title for w in {"etf", "fund", "index"}):
+                        affected_classes.append("ETFs")
+                    if not affected_classes:
+                        affected_classes = ["Stocks"]
+
+                    published = article.get("publishedAt", datetime.now(timezone.utc).isoformat())
+
+                    news_items.append({
+                        "id":              f"news-{len(news_items)}",
+                        "title":           title,
+                        "summary":         article.get("description") or article.get("content") or title,
+                        "source":          (article.get("source") or {}).get("name", "Unknown"),
+                        "url":             article.get("url", "#"),
+                        "published_at":    published,
+                        "sentiment":       sentiment,
+                        "affected_assets": [],
+                        "affected_classes": affected_classes,
+                        "impact":          impact,
+                    })
+        except Exception as exc:
+            logger.warning("NewsAPI fetch failed: %s — using RAG fallback", exc)
+
+    # ── RAG fallback — retrieve top news context chunks ─────────────────────────
+    if not news_items:
+        try:
+            retriever = bot._evaluator.retriever
+            ctx = retriever.get_news_context("market moving financial news")
+            chunks = ctx.get("results", []) if isinstance(ctx, dict) else []
+            for i, chunk in enumerate(chunks[:limit]):
+                text = chunk.get("document", "") if isinstance(chunk, dict) else str(chunk)
+                if not text:
+                    continue
+                news_items.append({
+                    "id":              f"rag-news-{i}",
+                    "title":           text[:100].strip(),
+                    "summary":         text[:300].strip(),
+                    "source":          "FinNexus RAG",
+                    "url":             "#",
+                    "published_at":    datetime.now(timezone.utc).isoformat(),
+                    "sentiment":       "neutral",
+                    "affected_assets": [],
+                    "affected_classes": ["Stocks", "Crypto"],
+                    "impact":          "medium",
+                })
+        except Exception as exc:
+            logger.warning("RAG news fallback also failed: %s", exc)
+
+    # Apply class filter if requested
+    if filter and filter != "All":
+        news_items = [n for n in news_items if filter in n.get("affected_classes", [])]
+
+    return {"news": news_items[:limit], "count": len(news_items[:limit])}
+
+
+# ── User profile endpoint (onboarding) ────────────────────────────────────────
+
+class UpdateProfileRequest(BaseModel):
+    user_id: int
+    name:           Optional[str]  = None
+    email:          Optional[str]  = None
+    current_level:  Optional[int]  = None
+    tracked_assets: Optional[List[str]] = None
+    experience:     Optional[str]  = None
+
+
+@app.post("/user/profile", tags=["User"])
+def update_user_profile(
+    req: UpdateProfileRequest,
+    _user: Dict = Depends(get_current_user),
+) -> Dict:
+    """Update user profile fields after onboarding."""
+    try:
+        updates: Dict[str, Any] = {}
+        if req.name          is not None: updates["name"]          = req.name
+        if req.email         is not None: updates["email"]         = req.email
+        if req.current_level is not None: updates["current_level"] = req.current_level
+        result = bot.update_user_profile(req.user_id, **updates)
+        return result
+    except Exception as exc:
+        logger.error("update_user_profile error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 

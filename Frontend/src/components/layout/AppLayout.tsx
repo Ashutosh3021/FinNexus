@@ -20,7 +20,7 @@ const navItems = [
 
 export function AppLayout() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const { user, logout, simulateRefresh, isLoading, lastPriceUpdate } = useAppStore()
+  const { user, logout, refreshFromAPI, isLoading, lastPriceUpdate } = useAppStore()
   const navigate = useNavigate()
 
   const handleLogout = () => {
@@ -148,7 +148,7 @@ export function AppLayout() {
               <span className="text-xs font-headline text-primary">Live</span>
             </div>
             <button
-              onClick={simulateRefresh}
+              onClick={refreshFromAPI}
               disabled={isLoading}
               className="p-1.5 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface transition-colors disabled:opacity-50"
               title="Refresh prices"

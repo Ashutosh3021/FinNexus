@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { ArrowUpRight, ArrowDownRight, Minus, RefreshCw, Clock } from 'lucide-react'
 import { useAppStore } from '../store/useAppStore'
 import { PriceChart } from '../components/ui/PriceChart'
@@ -8,8 +8,13 @@ import type { Asset, AssetClass } from '../types'
 const CLASS_TABS: (AssetClass | 'All')[] = ['All', 'Stocks', 'Crypto', 'ETFs', 'Futures', 'Commodities']
 
 export function PricesPage() {
-  const { assets, selectedAssetClass, setAssetClass, isLoading, simulateRefresh, lastPriceUpdate } = useAppStore()
+  const { assets, selectedAssetClass, setAssetClass, isLoading, simulateRefresh, lastPriceUpdate, fetchPrices } = useAppStore()
   const [selectedAsset, setSelectedAsset] = useState<Asset | null>(null)
+
+  // Fetch live prices on mount
+  useEffect(() => {
+    fetchPrices()
+  }, [fetchPrices])
 
   const filtered = selectedAssetClass === 'All' ? assets : assets.filter(a => a.assetClass === selectedAssetClass)
 
@@ -36,7 +41,7 @@ export function PricesPage() {
           </p>
         </div>
         <button
-          onClick={simulateRefresh}
+          onClick={() => { fetchPrices(); simulateRefresh() }}
           disabled={isLoading}
           className="flex items-center gap-2 text-sm font-headline text-primary hover:text-primary-container transition-colors disabled:opacity-50 self-start sm:self-auto"
         >

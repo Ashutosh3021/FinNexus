@@ -2,15 +2,32 @@ import { useNavigate } from 'react-router-dom'
 import { Terminal, Activity, Zap, ShieldCheck, BarChart2, Users } from 'lucide-react'
 import { Button } from '../components/ui/Button'
 import { useAppStore } from '../store/useAppStore'
-import { mockUser } from '../data/mockData'
+import type { User } from '../types'
+
+// Stable demo user — created on first "Google Sign In" click.
+// In production, replace this with a real OAuth flow that returns user data.
+function createDemoUser(): User {
+  return {
+    id:            'user-1',
+    name:          'Demo Trader',
+    email:         'demo@finnexus.app',
+    avatar:        'DT',
+    paperCash:     100,
+    currentLevel:  1,
+    trackedAssets: ['btc', 'eth', 'nifty50', 'gold'],
+    joinedAt:      new Date().toISOString().split('T')[0],
+  }
+}
 
 export function LandingPage() {
   const navigate = useNavigate()
   const login = useAppStore((s) => s.login)
 
-  const handleGoogleLogin = () => {
-    // Simulate Google OAuth — in prod this calls your OAuth provider
-    login(mockUser)
+  const handleGoogleLogin = async () => {
+    // Simulate Google OAuth — in production, call your OAuth provider here,
+    // receive the user profile, then call login().
+    const demoUser = createDemoUser()
+    await login(demoUser)
     navigate('/onboarding')
   }
 

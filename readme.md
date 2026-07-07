@@ -688,13 +688,18 @@ graph LR
 
 ### Key Metrics to Track
 
-| Metric | Target | Alert Threshold |
-|--------|--------|-----------------|
-| **Accuracy** | >60% | <55% |
+| Metric | Actual (backtested) | Alert Threshold |
+|--------|---------------------|-----------------|
+| **Accuracy** | ~50% avg; top stocks ~65-70% | <45% |
 | **Confidence** | >0.7 | <0.5 |
 | **Return** | >10% | <0% |
 | **API Latency** | <500ms | >2000ms |
 | **Error Rate** | <1% | >5% |
+
+> **Note on accuracy:** The ~50% average is across all 340 backtested models.
+> Individual high-signal assets (Cotton, TRX, several mid/smallcap stocks) reach
+> 65–70% on held-out test sets. See `Data/Model_Results/model_performance_report.txt`
+> for per-asset numbers. Treat all predictions as probabilistic signals.
 
 ---
 

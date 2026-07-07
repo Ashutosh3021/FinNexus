@@ -457,15 +457,20 @@ def _score_saq_with_llm(
             raise ValueError("No JSON object found in LLM scoring response")
         data = json.loads(match.group(0))
 
+        def _dim(key: str, default: int = 10) -> int:
+            # FIX #8 — Clamp every LLM-returned dimension to [0, 20] so that
+            # ScoreResult.total can never exceed 100 regardless of LLM output.
+            return max(0, min(20, int(data.get(key, default))))
+
         return ScoreResult(
             question_id=question_id,
             question_type=question_type,
             user_answer=answer,
-            risk_awareness=int(data.get("risk_awareness", 10)),
-            market_understanding=int(data.get("market_understanding", 10)),
-            decision_quality=int(data.get("decision_quality", 10)),
-            adaptability=int(data.get("adaptability", 10)),
-            synthesis=int(data.get("synthesis", 10)),
+            risk_awareness=_dim("risk_awareness"),
+            market_understanding=_dim("market_understanding"),
+            decision_quality=_dim("decision_quality"),
+            adaptability=_dim("adaptability"),
+            synthesis=_dim("synthesis"),
             trader_profile=data.get("trader_profile", ""),
             strengths=data.get("strengths", []),
             growth_areas=data.get("growth_areas", []),

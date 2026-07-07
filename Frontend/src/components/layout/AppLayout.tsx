@@ -3,10 +3,15 @@ import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 import {
   Terminal, BarChart2, TrendingUp, Brain, Shield,
   Swords, Newspaper, Users, LogOut, Menu, X, RefreshCw,
-  ChevronRight,
+  ChevronRight, AlertTriangle,
 } from 'lucide-react'
 import { cn } from '../../lib/utils'
 import { useAppStore } from '../../store/useAppStore'
+
+// FIX #4 — Detect whether the app is running against a live backend or mock data.
+// VITE_USE_API=true enables live backend calls; false (default) uses mock data.
+// This constant is evaluated at build time so there is no runtime overhead.
+const USE_API = import.meta.env.VITE_USE_API === 'true'
 
 const navItems = [
   { to: '/app/prices',      icon: BarChart2,   label: 'Live Prices',    badge: 'F1' },
@@ -144,8 +149,17 @@ export function AppLayout() {
               <span>Updated {lastPriceUpdate}</span>
             </div>
             <div className="flex items-center gap-1.5">
-              <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse shadow-[0_0_6px_rgba(16,185,129,0.5)]" />
-              <span className="text-xs font-headline text-primary">Live</span>
+              {USE_API ? (
+                <>
+                  <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse shadow-[0_0_6px_rgba(16,185,129,0.5)]" />
+                  <span className="text-xs font-headline text-primary">Live</span>
+                </>
+              ) : (
+                <>
+                  <div className="w-1.5 h-1.5 rounded-full bg-tertiary" />
+                  <span className="text-xs font-headline text-tertiary">Demo</span>
+                </>
+              )}
             </div>
             <button
               onClick={refreshFromAPI}
@@ -165,6 +179,21 @@ export function AppLayout() {
         {/* Page content */}
         <main className="flex-1 overflow-y-auto">
           <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6">
+            {/* FIX #4 — Visible mock-data banner so no one mistakes demo data for live data */}
+            {!USE_API && (
+              <div
+                role="alert"
+                className="flex items-center gap-2 mb-5 px-4 py-2.5 rounded-lg border border-tertiary/30 bg-tertiary/8 text-tertiary"
+              >
+                <AlertTriangle size={13} className="shrink-0" />
+                <p className="text-xs font-headline font-semibold">
+                  Demo mode — showing mock data.&nbsp;
+                  <span className="font-normal opacity-80">
+                    Set <code className="font-data">VITE_USE_API=true</code> in your <code className="font-data">.env</code> to connect a live backend.
+                  </span>
+                </p>
+              </div>
+            )}
             <Outlet />
           </div>
         </main>

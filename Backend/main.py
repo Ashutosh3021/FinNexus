@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 import glob
 from datetime import datetime, timedelta, timezone
@@ -60,16 +61,76 @@ except ImportError:
     logger.warning("PyJWT not installed — JWT auth disabled. pip install PyJWT")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-_JWT_SECRET    = os.getenv("JWT_SECRET",    "finnexus-dev-secret-change-in-production")
+# FIX #1 — JWT secret: no hardcoded fallback. Server refuses to start without a
+#           real secret in production (ENV=production).
+_JWT_SECRET = os.getenv("JWT_SECRET", "")
 _JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 _JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))  # 24 hours
-_API_KEY       = os.getenv("FINNEXUS_API_KEY", "")  # optional external service API key
+_API_KEY = os.getenv("FINNEXUS_API_KEY", "")  # optional external service API key
 
+_ENV = os.getenv("ENV", "development").lower()  # "production" | "development"
+
+# FIX #1 — Enforce non-default secret in production at startup.
+_INSECURE_SECRETS = {
+    "", "finnexus-dev-secret-change-in-production",
+    "change-this-to-a-secure-random-string-in-production",
+    "secret", "changeme",
+}
+if _ENV == "production" and _JWT_SECRET in _INSECURE_SECRETS:
+    logger.critical(
+        "STARTUP ABORTED: JWT_SECRET is missing or insecure in production. "
+        "Set a strong random JWT_SECRET in your environment."
+    )
+    sys.exit(1)
+
+# Use a dev-only fallback so the server still starts in development without .env
+if not _JWT_SECRET:
+    _JWT_SECRET = "finnexus-dev-only-do-not-use-in-production"
+    logger.warning(
+        "JWT_SECRET not set — using insecure dev default. "
+        "Set JWT_SECRET in your .env before deploying."
+    )
+
+# FIX #3 — CORS: in production, CORS_ORIGINS MUST be set and must not contain
+#           localhost. The server refuses to start if this rule is violated.
 _ALLOWED_ORIGINS = [
     o.strip() for o in
-    os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173").split(",")
+    os.getenv("CORS_ORIGINS", "").split(",")
     if o.strip()
 ]
+
+_LOCALHOST_ORIGINS = {"localhost", "127.0.0.1", "0.0.0.0"}
+
+if _ENV == "production":
+    _cors_has_localhost = any(
+        any(loc in origin for loc in _LOCALHOST_ORIGINS)
+        for origin in _ALLOWED_ORIGINS
+    )
+    if not _ALLOWED_ORIGINS:
+        logger.critical(
+            "STARTUP ABORTED: CORS_ORIGINS is not set in production. "
+            "Set CORS_ORIGINS to your frontend domain(s)."
+        )
+        sys.exit(1)
+    if _cors_has_localhost:
+        logger.critical(
+            "STARTUP ABORTED: CORS_ORIGINS contains a localhost origin in production: %s. "
+            "Remove localhost entries before deploying.",
+            _ALLOWED_ORIGINS,
+        )
+        sys.exit(1)
+
+# Development fallback — allow localhost so local dev works without a .env
+if not _ALLOWED_ORIGINS:
+    _ALLOWED_ORIGINS = [
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+    ]
+    logger.warning(
+        "CORS_ORIGINS not set — defaulting to localhost dev origins. "
+        "Set CORS_ORIGINS in production."
+    )
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -194,8 +255,22 @@ class AssessRequest(BaseModel):
 
 # ── Auth endpoints (public) ────────────────────────────────────────────────────
 
+# FIX #2 — Rate limiting decorators applied to all public + session endpoints.
+# slowapi requires the decorated function to accept `request: Request` as a
+# parameter. The `limiter.limit()` decorator is only applied when slowapi is
+# available; otherwise the route registers normally with no rate limiting
+# (a warning was already emitted at startup).
+
+def _rate_limit(rate: str):
+    """Return slowapi limit decorator if available, else a no-op pass-through."""
+    if _SLOWAPI_OK and limiter:
+        return limiter.limit(rate)
+    return lambda f: f
+
+
 @app.post("/auth/token", tags=["Auth"])
-def login(req: LoginRequest) -> LoginResponse:
+@_rate_limit("20/minute")
+def login(request: Request, req: LoginRequest) -> LoginResponse:
     """
     Obtain a JWT access token for a user ID.
     In production, validate credentials here before issuing the token.
@@ -211,9 +286,60 @@ def login(req: LoginRequest) -> LoginResponse:
 # ── Health (public) ────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["System"])
-def health_check() -> Dict:
-    """Liveness probe. No auth required."""
-    return {"status": "ok", "service": "finnexus-bot-api"}
+@_rate_limit("60/minute")
+def health_check(request: Request) -> Dict:
+    """
+    FIX #9 — Real liveness + readiness probe.
+    Checks DB connectivity, ChromaDB (RAG), ML model, and LLM availability.
+    No auth required.
+    """
+    checks: Dict[str, Any] = {}
+
+    # DB
+    try:
+        _ = bot._db.get_paper_cash(0)
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = f"error: {exc}"
+
+    # RAG / ChromaDB
+    try:
+        rag_stats = bot._evaluator.retriever.stats()
+        counts = rag_stats.get("collection_counts", {})
+        checks["rag"] = {
+            "chroma_available": rag_stats.get("chroma_available", False),
+            "collection_counts": counts,
+        }
+    except Exception as exc:
+        checks["rag"] = f"error: {exc}"
+
+    # ML model
+    try:
+        ml_stats = bot.get_ml_stats()
+        checks["ml"] = {
+            "model_available": ml_stats.get("model_available", False),
+            "n_trained": ml_stats.get("n_trained", 0),
+        }
+    except Exception as exc:
+        checks["ml"] = f"error: {exc}"
+
+    # LLM
+    checks["llm"] = {
+        "provider": cfg.LLM_PROVIDER,
+        "available": bot._qgen.llm.available if bot._qgen.llm else False,
+    }
+
+    # Overall status — "degraded" if any non-critical subsystem is unhealthy
+    db_ok = checks["db"] == "ok"
+    overall = "ok" if db_ok else "degraded"
+
+    return {
+        "status": overall,
+        "service": "finnexus-bot-api",
+        "env": _ENV,
+        "subsystems": checks,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get("/health/ml", tags=["System"])
@@ -225,7 +351,9 @@ def ml_health(_: Dict = Depends(get_current_user)) -> Dict:
 # ── Session endpoints (protected) ─────────────────────────────────────────────
 
 @app.post("/session/start", tags=["Session"])
+@_rate_limit("100/minute")
 def start_session(
+    request: Request,
     req: StartSessionRequest,
     _user: Dict = Depends(get_current_user),
 ) -> Dict:
@@ -256,7 +384,9 @@ def start_session(
 
 
 @app.get("/session/question", tags=["Session"])
+@_rate_limit("100/minute")
 def get_current_question(
+    request: Request,
     user_id: int = Query(..., description="User ID"),
     _user: Dict = Depends(get_current_user),
 ) -> Dict:
@@ -268,7 +398,9 @@ def get_current_question(
 
 
 @app.post("/session/answer", tags=["Session"])
+@_rate_limit("100/minute")
 def submit_answer(
+    request: Request,
     req: SubmitAnswerRequest,
     _user: Dict = Depends(get_current_user),
 ) -> Dict:
@@ -378,7 +510,9 @@ class SubmitAnswersV2Request(BaseModel):
 
 
 @app.post("/v2/session/start", tags=["Session V2"])
+@_rate_limit("100/minute")
 async def start_session_v2(
+    request: Request,
     req: StartSessionV2Request,
     _user: Dict = Depends(get_current_user),
 ) -> Dict:
@@ -401,7 +535,9 @@ async def start_session_v2(
 
 
 @app.post("/v2/session/answers", tags=["Session V2"])
+@_rate_limit("100/minute")
 async def submit_answers_v2(
+    request: Request,
     req: SubmitAnswersV2Request,
     _user: Dict = Depends(get_current_user),
 ) -> Dict:
@@ -522,7 +658,8 @@ def _build_price_entry(asset_id: str, meta: Dict, rows: List[Dict]) -> Optional[
 
 
 @app.get("/market/prices", tags=["Market"])
-def market_prices() -> Dict:
+@_rate_limit("60/minute")
+def market_prices(request: Request) -> Dict:
     """
     Return the latest price snapshot for all tracked assets.
     Reads from Data/Cleaned CSVs — no auth required.
@@ -538,7 +675,9 @@ def market_prices() -> Dict:
 
 
 @app.get("/market/trends", tags=["Market"])
+@_rate_limit("60/minute")
 def market_trends(
+    request: Request,
     timeframe: str = Query("1D", description="1D | 1W | 1M"),
     asset_class: Optional[str] = Query(None, description="Filter by asset class"),
 ) -> Dict:
@@ -576,7 +715,9 @@ def market_trends(
 # static headlines derived from the RAG news_events collection.
 
 @app.get("/market/news", tags=["Market"])
+@_rate_limit("60/minute")
 def market_news(
+    request: Request,
     limit: int = Query(20, ge=1, le=100),
     filter: Optional[str] = Query(None, description="Asset class filter"),
 ) -> Dict:

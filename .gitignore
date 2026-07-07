@@ -13,3 +13,26 @@ __init__.py
 *.env
 STATUS.md
 state.md
+
+# FIX #7 — Model artifacts and databases must not be committed.
+# The XGBoost model, scaler, and SQLite databases can be large and may
+# contain user data. They are reproduced at runtime from training data.
+Bot/model/artifacts/*.pkl
+Bot/model/artifacts/*.json
+Bot/model/*.db
+Data/session_store.db
+*.db
+*.pkl
+
+# Build outputs
+Frontend/dist/
+Frontend/node_modules/
+
+# Python build artefacts
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+DEPLOY.md
+# FINAL_AUDIT_REPORT.md

@@ -1,5 +1,4 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { useAppStore } from '../store/useAppStore'
 import { ConfidenceRing } from '../components/ui/ConfidenceRing'
 import { cn } from '../lib/utils'
@@ -8,7 +7,6 @@ import type { Prediction, Asset } from '../types'
 
 export function PredictionsPage() {
   const { predictions, assets } = useAppStore()
-  const navigate = useNavigate()
   const [analyzedSymbol, setAnalyzedSymbol] = useState<string | null>(null)
 
   const handleAnalyze = (symbol: string) => {

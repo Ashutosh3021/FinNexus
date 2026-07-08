@@ -361,18 +361,17 @@ export async function updateUserProfile(
   })
 }
 
-// ── V2 session helpers (re-exported for convenience) ─────────────────────────
-
-export type { StartSessionV2Response }
-
 // ── Generic API error ─────────────────────────────────────────────────────────
 
 export class ApiError extends Error {
+  readonly status?: number;
+  
   constructor(
     message: string,
-    public readonly status?: number,
+    status?: number,
   ) {
     super(message)
     this.name = 'ApiError'
+    this.status = status;
   }
 }

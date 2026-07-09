@@ -40,6 +40,6 @@ supabase>=2.3.0
 
 # ── Required by import graph (unguarded top-level imports) ───────
 python-dotenv>=1.0.0          # Bot/config.py: from dotenv import load_dotenv
-numpy>=1.24.0,<2.3.0          # Bot/model/main.py: import numpy as np
+numpy<2.0          # Bot/model/main.py: import numpy as np
 pandas>=2.0.0,<2.3.0          # Bot/RAG/ingest.py: import pandas as pd
 requests>=2.31.0              # Bot/RAG/ingest.py: import requests

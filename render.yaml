@@ -6,7 +6,7 @@ services:
     buildCommand: |
       ls -la
       pip install -r Backend/requirements.txt
-    startCommand: gunicorn Backend.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:$PORT
+    startCommand: python -m gunicorn Backend.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:$PORT
     envVars:
       - key: ENV
         value: production

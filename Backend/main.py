@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from Bot.main import FinnexusBot
@@ -167,6 +168,24 @@ app.add_middleware(
 
 # ── Singleton bot (lazy-initialized in lifespan; see above) ────────────────────
 bot: Optional[FinnexusBot] = None
+
+# ── Startup readiness guard (H3) ───────────────────────────────────────────────
+# The bot is initialized inside the lifespan hook (after the port is already
+# bound), so a request that arrives during that window would otherwise hit
+# `bot is None` and 500. Reject such requests with a clean 503 instead.
+# /health is exempt so probes report "degraded" rather than failing during init.
+# This is a no-op once startup completes (bot is set), so steady-state behaviour
+# is unchanged — only the boot window is guarded.
+_READINESS_EXEMPT: set[str] = {"/health", "/docs", "/openapi.json", "/redoc"}
+
+@app.middleware("http")
+async def _readiness_guard(request: Request, call_next):
+    if bot is None and request.url.path not in _READINESS_EXEMPT:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "Service initializing — please retry in a few seconds."},
+        )
+    return await call_next(request)
 
 # ── Security ───────────────────────────────────────────────────────────────────
 _bearer = HTTPBearer(auto_error=False)

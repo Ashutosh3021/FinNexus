@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 # ── ChromaDB ────────────────────────────────────────────────────────────────
 try:
     import chromadb  # type: ignore
-    from chromadb.config import Settings  # type: ignore
     _CHROMA_OK = True
 except ImportError:
     _CHROMA_OK = False
@@ -123,6 +122,19 @@ class RAGRetriever:
 
     # ── Initialise ChromaDB client ────────────────────────────────────────────
 
+    def _build_chroma_settings(self):
+        # M4: chromadb moved/removed `Settings` across versions; resolve it from
+        # the location available in the installed version instead of the
+        # deprecated `chromadb.config.Settings` import path.
+        try:
+            from chromadb.config import Settings  # type: ignore
+        except Exception:
+            try:
+                from chromadb import Settings  # type: ignore
+            except Exception:
+                return None
+        return Settings(anonymized_telemetry=False)
+
     def _init_client(self) -> None:
         if not _CHROMA_OK:
             return
@@ -130,7 +142,7 @@ class RAGRetriever:
             Path(self._persist_path).mkdir(parents=True, exist_ok=True)
             self._client = chromadb.PersistentClient(
                 path=self._persist_path,
-                settings=Settings(anonymized_telemetry=False),
+                settings=self._build_chroma_settings(),
             )
             logger.info("RAGRetriever: ChromaDB connected at %s", self._persist_path)
         except Exception as exc:

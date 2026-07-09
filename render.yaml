@@ -5,7 +5,7 @@ services:
     rootDir: .
     buildCommand: |
       ls -la
-      pip install -r requirements.txt
+      pip install -r Backend/requirements.txt
     startCommand: gunicorn Backend.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:$PORT
     envVars:
       - key: ENV
@@ -16,6 +16,8 @@ services:
         generateValue: true
       - key: PYTHON_VERSION
         value: 3.11.6
+      - key: CORS_ORIGINS
+        value: https://your-finnexus-app.vercel.app
       # Add other required vars from .env.example:
       # - key: LLM_PROVIDER
       #   value: groq

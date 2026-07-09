@@ -1,0 +1,45 @@
+# ============================================================
+# FinNexus — Backend API Requirements
+# Python 3.11.6
+#
+# Lean dependency set for the Render web service (Backend/main.py
+# and its import graph: Bot.main, Bot.RAG, Bot.model, Bot.db).
+# This deliberately EXCLUDES the data-pipeline / heavy-ML stack
+# (nselib, nsepy, yfinance, jugaad-data, nsefin, alpha-vantage,
+# oilpriceapi, eodhd, eia-ng-client, beautifulsoup4, lxml, ccxt,
+# openpyxl, xlrd, matplotlib, scipy, scikit-learn, xgboost,
+# catboost, lightgbm, pyzdata, redis, tqdm).
+#
+# NOTE: xgboost and scikit-learn are intentionally omitted — they
+# are imported inside try/except in Bot/model/main.py and degrade
+# gracefully to a dummy scorer when absent.
+# ============================================================
+
+# ── Web server ──────────────────────────────────────────────────
+fastapi>=0.104.0
+uvicorn>=0.24.0
+gunicorn>=21.0
+
+# ── API / data validation ───────────────────────────────────────
+pydantic>=2.0.0
+
+# ── LLM client (Bot.llm_generator) ──────────────────────────────
+openai>=1.0.0
+httpx>=0.24.0
+
+# ── RAG / embeddings (Bot.RAG.retriever, Bot.RAG.ingest) ─────────
+chromadb>=0.4.22,<0.5
+sentence-transformers>=2.2.0
+
+# ── Auth & security (Backend/main.py) ───────────────────────────
+PyJWT>=2.8.0
+slowapi>=0.1.9
+
+# ── Database (Bot.db SupabaseDB + SQLite fallback) ──────────────
+supabase>=2.3.0
+
+# ── Required by import graph (unguarded top-level imports) ───────
+python-dotenv>=1.0.0          # Bot/config.py: from dotenv import load_dotenv
+numpy>=1.24.0,<2.3.0          # Bot/model/main.py: import numpy as np
+pandas>=2.0.0,<2.3.0          # Bot/RAG/ingest.py: import pandas as pd
+requests>=2.31.0              # Bot/RAG/ingest.py: import requests

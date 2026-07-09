@@ -36,7 +36,7 @@ export function ToastContainer() {
           className={cn(
             'flex items-start gap-3 bg-surface-container-low rounded-xl border px-4 py-3',
             'shadow-[0_4px_24px_rgba(0,0,0,0.4)] backdrop-blur-sm',
-            'pointer-events-auto animate-in slide-in-from-right-4 fade-in-0 duration-200',
+            'pointer-events-auto',
             BORDER_COLORS[t.variant],
           )}
         >

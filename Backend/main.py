@@ -22,6 +22,7 @@ import os
 import sys
 import time
 import glob
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -133,10 +134,23 @@ if not _ALLOWED_ORIGINS:
     )
 
 # ── App ────────────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # H3: lazy-init the bot OUTSIDE import time. Heavy RAG ingestion + model
+    # loading now runs at worker startup (once), not at module import, so the
+    # app can finish importing even if bot init is slow. Each gunicorn worker
+    # initializes its own instance.
+    global bot
+    logger.info("FinnexusBot: initializing (lazy startup)…")
+    bot = FinnexusBot.from_env()
+    logger.info("FinnexusBot: ready.")
+    yield
+
 app = FastAPI(
     title="FinNexus HITL Bot API",
     description="Human-in-the-Loop financial training bot — question engine, scoring, rewards.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 if _SLOWAPI_OK and limiter:
@@ -151,8 +165,8 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
-# ── Singleton bot ──────────────────────────────────────────────────────────────
-bot: FinnexusBot = FinnexusBot.from_env()
+# ── Singleton bot (lazy-initialized in lifespan; see above) ────────────────────
+bot: Optional[FinnexusBot] = None
 
 # ── Security ───────────────────────────────────────────────────────────────────
 _bearer = HTTPBearer(auto_error=False)

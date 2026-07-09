@@ -213,7 +213,7 @@ class SupabaseDB(BotDB):
             on_conflict="user_id,level_completed",
         ).execute()
         # Also update running total
-        self._table("user_bot_progress").rpc(
+        self._client.rpc(
             "increment_total_cash",
             {"p_user_id": user_id, "p_amount": reward},
         ).execute()
@@ -244,10 +244,11 @@ class SupabaseDB(BotDB):
             self._table("users")
             .select("paper_cash")
             .eq("id", user_id)
-            .single()
+            .limit(1)
             .execute()
         )
-        current = result.data.get("paper_cash", 0) if result.data else 0
+        row = result.data[0] if result.data else None
+        current = row.get("paper_cash", 0) if row else 0
         new_total = current + amount
         self._table("users").update({"paper_cash": new_total}).eq("id", user_id).execute()
         return new_total
@@ -257,10 +258,11 @@ class SupabaseDB(BotDB):
             self._table("users")
             .select("paper_cash")
             .eq("id", user_id)
-            .single()
+            .limit(1)
             .execute()
         )
-        return result.data.get("paper_cash", 0) if result.data else 0
+        row = result.data[0] if result.data else None
+        return row.get("paper_cash", 0) if row else 0
 
     def get_user_profile(self, user_id: int) -> Dict:
         result = (

@@ -184,13 +184,28 @@ class MLModel:
             self._n_trained = meta.get("n_trained", 0)
             self._val_metrics = meta.get("val_metrics", {})
 
+    def _atomic_dump(self, path: Path, obj: Any) -> None:
+        # H3: write to a temp file in the same directory, then atomically
+        # replace. Prevents two concurrent gunicorn workers from writing the
+        # pickle simultaneously and producing a corrupt/partial file.
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(obj, f)
+            os.replace(tmp, str(path))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
     def _save(self) -> None:
         if self._model:
-            with open(self._model_path(), "wb") as f:
-                pickle.dump(self._model, f)
+            self._atomic_dump(self._model_path(), self._model)
         if self._scaler:
-            with open(self._scaler_path(), "wb") as f:
-                pickle.dump(self._scaler, f)
+            self._atomic_dump(self._scaler_path(), self._scaler)
         self._meta_path().write_text(json.dumps({
             "n_trained": self._n_trained,
             "val_metrics": self._val_metrics,
